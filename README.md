@@ -1,4 +1,4 @@
-# Dupe
+# Dupe.Ad
 
 Bulk-duplicate Meta ads across all your Pages.
 
