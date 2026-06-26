@@ -1,0 +1,28 @@
+# ─────────────────────────────────────────────────────────────────────────
+# Vercel deploy excludes.
+#
+# IMPORTANT: `vercel` CLI deploys honor THIS file, NOT .gitignore. This mirrors
+# .gitignore's data/secret rules so a local `vercel deploy` can never bundle real
+# client data or secrets that git already keeps out of the repo. Keep the two in
+# sync. (Git-integration deploys build from the repo, so they are already safe.)
+# ─────────────────────────────────────────────────────────────────────────
+
+# Environment & secrets — never ship real tokens/keys. Keep the tracked example.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Client data — real discovery snapshots, per-account mappings, tag lists, and the
+# AI-copywriter training spreadsheet. Keep only the non-sensitive example mapping.
+/data/discovery/
+/data/tags/
+/data/mapping/*.csv
+!/data/mapping/example.csv
+*.xlsx
+*.xls
+
+# Internal docs + design mocks — local only.
+/docs/
+/design/

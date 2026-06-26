@@ -1,0 +1,253 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* =============================================================================
+   Dupe runtime tokens. Direction: clean, neutral, modern LIGHT
+   (Linear / Vercel-light): white surfaces, cool SLATE neutrals, and ONE crisp
+   indigo accent. Light is the shipped DEFAULT under :root; a dark variant is
+   authored under [data-theme="dark"] so the theme stays a token swap, not a fork.
+   Token NAMES are stable — surfaces + accent are a quick re-swap. See
+   docs/design/DESIGN-SYSTEM.md and design/tokens.css (the documented mirror).
+   ========================================================================== */
+:root {
+  color-scheme: light;
+
+  /* Surfaces & structure — white cards over the dupe.ad warm-gray frame */
+  --fas-void:            #EDEFF2; /* app frame behind everything (matches site sections) */
+  --fas-canvas:          #FFFFFF; /* page canvas / table gutter                 */
+  --fas-surface:         #FFFFFF; /* cards, table body, header bar, modal       */
+  --fas-surface-raised:  #FFFFFF; /* sticky summary bar, popovers, switcher     */
+  --fas-surface-sunken:  #F1F3F6; /* table header strip, input wells, disabled  */
+  --fas-surface-alt:     #F7F8FA; /* zebra alt-row (visible, no longer ghost)   */
+  --fas-hairline:        #E4E6EA; /* 1px dividers, cell separators, card edges  */
+  --fas-hairline-strong: #D3D7DD; /* hovered borders, sticky-header underline   */
+  --fas-grid-tick:       #EEF0F3; /* faint vertical column rules                */
+
+  /* Ink — warm near-black scale (matches the site) */
+  --fas-ink:             #14161B; /* primary: store names, headings             */
+  --fas-ink-muted:       #555B66; /* secondary: campaign/adset, data            */
+  --fas-ink-faint:       #8B919C; /* tertiary: placeholders, em-dash            */
+  --fas-ink-mono:        #3A4150; /* mono IDs / hashes                          */
+  --fas-ink-on-accent:   #FFFFFF; /* text on the accent action fill            */
+
+  /* Action accent — the dupe.ad steel blue (NEVER a status hue) */
+  --fas-accent:          #2B5C8A; /* primary fill, active tab, links            */
+  --fas-accent-hover:    #234C73; /* hover                                      */
+  --fas-accent-pressed:  #1C3E5E; /* :active inset                             */
+  --fas-accent-tint:     #E9F1F8; /* active-tab pill, selected-row, focus glow */
+  --fas-accent-ring:     #4F86B8; /* keyboard focus ring                       */
+
+  /* Reconciliation status (6 real states) — fg/bg/border, AA on white */
+  --fas-ok:              #15803D; /* green-700                                  */
+  --fas-ok-bg:           #ECFDF3;
+  --fas-ok-border:       #BBF0CB;
+  --fas-mismatch:        #B42318; /* loudest — warm red                         */
+  --fas-mismatch-bg:     #FEF2F1;
+  --fas-mismatch-border: #FBC9C2;
+  --fas-missing-api:     #475569; /* slate (live read-back broken)              */
+  --fas-missing-api-bg:  #F1F4F8;
+  --fas-missing-api-border: #C2CCDB;
+  --fas-missing-map:     #92610A; /* amber (operator-fixable)                   */
+  --fas-missing-map-bg:  #FDF6E3;
+  --fas-missing-map-border: #F2E0AC;
+  --fas-no-code:         #475569; /* gray (slate-600 — AA at small sizes)       */
+  --fas-no-code-bg:      #F4F6F9;
+  --fas-no-code-border:  #DEE4ED;
+  --fas-api-error:       #B23A12; /* deep red-orange                            */
+  --fas-api-error-bg:    #FDF1EC;
+  --fas-api-error-border: #F5CDBC;
+
+  /* Split-page hazard — orange */
+  --fas-split:           #B45309; /* amber-700/orange                          */
+  --fas-split-bg:        #FFF5E8;
+  --fas-split-border:    #F5D8A6;
+  --fas-split-rail:      #C2610C;
+
+  /* Delivery axis */
+  --fas-deliver-active:  #15803D;
+  --fas-deliver-paused:  #64748B;
+  --fas-deliver-review:  #92610A;
+
+  /* Health & system plates (neutral health — never green) */
+  --fas-health-ok:       #64748B;
+  --fas-health-degraded: #92610A;
+  --fas-health-down:     #B42318;
+  --fas-readonly-plate:  #F1F4F8;
+
+  /* Spacing */
+  --fas-space-1: 4px;  --fas-space-2: 8px;  --fas-space-3: 12px; --fas-space-4: 16px;
+  --fas-space-5: 20px; --fas-space-6: 24px; --fas-space-8: 32px; --fas-space-12: 48px;
+
+  /* Radii — soft modern */
+  --fas-radius-sm: 4px; --fas-radius-md: 6px; --fas-radius-lg: 10px; --fas-radius-pill: 9999px;
+
+  /* Density */
+  --fas-row-comfortable: 40px;
+  --fas-row-compact:     32px;
+  --fas-row-h:           var(--fas-row-comfortable);
+
+  /* Typography — Hanken Grotesk (UI), Sora (display), JetBrains Mono (IDs) */
+  --fas-font-sans: var(--font-hanken), "Hanken Grotesk", -apple-system, "Segoe UI", Roboto, system-ui, sans-serif;
+  --fas-font-display: var(--font-sora), "Sora", var(--font-hanken), system-ui, sans-serif;
+  --fas-font-mono: var(--font-jetbrains), "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --fas-tracking-caps: 0.06em;
+  --fas-tracking-caps-tight: 0.04em;
+
+  /* Elevation — on light, lift comes from soft shadow (bezel suppressed) */
+  --fas-bezel:        inset 0 0 0 0 transparent;
+  --fas-shadow-card:  0 1px 2px rgba(15, 23, 42, 0.05);
+  --fas-shadow-pop:   0 8px 24px rgba(15, 23, 42, 0.10);
+  --fas-shadow-modal: 0 16px 48px rgba(15, 23, 42, 0.18);
+  --fas-scrim:        rgba(15, 23, 42, 0.40);
+
+  /* Motion */
+  --fas-dur-fast: 110ms; --fas-dur-base: 170ms; --fas-dur-slow: 220ms;
+  --fas-ease: cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* DARK VARIANT (authored; enable via <html data-theme="dark">). Same token NAMES
+   → a pure toggle. The original graphite "AEGIS" board, retained as an option. */
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --fas-void:            #0A0C10;
+  --fas-canvas:          #0E1117;
+  --fas-surface:         #151921;
+  --fas-surface-raised:  #1B212B;
+  --fas-surface-sunken:  #0C0F14;
+  --fas-surface-alt:     #12161D;
+  --fas-hairline:        #232A35;
+  --fas-hairline-strong: #323B49;
+  --fas-grid-tick:       #1A2029;
+
+  --fas-ink:             #EDF1F7;
+  --fas-ink-muted:       #A4AEBC;
+  --fas-ink-faint:       #6B7585;
+  --fas-ink-mono:        #C4CCD8;
+  --fas-ink-on-accent:   #FFFFFF;
+
+  --fas-accent:          #3B82F6;
+  --fas-accent-hover:    #60A5FA;
+  --fas-accent-pressed:  #2563EB;
+  --fas-accent-tint:     #15233E;
+  --fas-accent-ring:     #60A5FA;
+
+  --fas-ok:              #3DD68C;
+  --fas-ok-bg:           #0E2A1E;
+  --fas-ok-border:       #1C4A37;
+  --fas-mismatch:        #FF6B6B;
+  --fas-mismatch-bg:     #3A0F12;
+  --fas-mismatch-border: #5A2224;
+  --fas-missing-api:     #9AA6B6;
+  --fas-missing-api-bg:  #1A1F27;
+  --fas-missing-api-border: #2C374C;
+  --fas-missing-map:     #F5B83D;
+  --fas-missing-map-bg:  #2E2207;
+  --fas-missing-map-border: #5A4514;
+  --fas-no-code:         #9AA6B6;
+  --fas-no-code-bg:      #1A1F27;
+  --fas-no-code-border:  #2C374C;
+  --fas-api-error:       #FF8A5C;
+  --fas-api-error-bg:    #361409;
+  --fas-api-error-border: #5E2A14;
+
+  --fas-split:           #FF8A3D;
+  --fas-split-bg:        #33200C;
+  --fas-split-border:    #5E3A14;
+  --fas-split-rail:      #E07A2E;
+
+  --fas-deliver-active:  #2FA968;
+  --fas-deliver-paused:  #646E7D;
+  --fas-deliver-review:  #C99A2E;
+
+  --fas-health-ok:       #8A97A8;
+  --fas-health-degraded: #F5B83D;
+  --fas-health-down:     #FF6B6B;
+  --fas-readonly-plate:  #1B212B;
+
+  --fas-bezel:        inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  --fas-shadow-card:  0 1px 2px rgba(0, 0, 0, 0.40);
+  --fas-shadow-pop:   0 8px 28px rgba(0, 0, 0, 0.55);
+  --fas-shadow-modal: 0 20px 60px rgba(0, 0, 0, 0.65);
+  --fas-scrim:        rgba(5, 7, 10, 0.66);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --fas-dur-fast: 0ms;
+    --fas-dur-base: 0ms;
+    --fas-dur-slow: 0ms;
+  }
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background-color: var(--fas-void);
+  color: var(--fas-ink);
+  font-family: var(--fas-font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  letter-spacing: -0.006em;
+}
+
+/* Text selection matches the dupe.ad site (soft blue, not the browser default). */
+::selection {
+  background: #CFE0EE;
+  color: #14161B;
+}
+
+/* Mono numerics: slashed zero is load-bearing — 0 vs O matters on a page_id. */
+.font-mono,
+[class*="font-mono"] {
+  font-feature-settings: "tnum" 1, "zero" 1;
+}
+
+/* -----------------------------------------------------------------------------
+   The 4px status LED left rail — always on, every row. Scanning down the table
+   you read a COLUMN of LEDs; a stray red/amber bar is caught in peripheral
+   vision before any text is parsed. A split row stacks a 2nd inner orange rail.
+   Color is supplied per-row via the inline --rail (and --rail2) custom props.
+   --------------------------------------------------------------------------- */
+.fas-rail {
+  position: relative;
+}
+.fas-rail::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 4px;
+  background: var(--rail, transparent);
+  /* No vertical rounding: the rail must reach top:0/bottom:0 flush so adjacent
+     anomaly rows butt into ONE continuous colored band (a true LED column),
+     not a stack of separated rounded lozenges. */
+}
+.fas-rail-split::after {
+  content: "";
+  position: absolute;
+  left: 5px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--rail2, transparent);
+}
+
+/* The "lit lamp" — a soft backlit halo, applied only to the loud chips
+   (MISMATCH / API_ERROR / SPLIT). On the clean light theme this is intentionally
+   very subtle. Quiet states (OK / NO_CODE / MISSING·API slate) stay flat. */
+.fas-halo {
+  box-shadow: var(--fas-bezel), 0 0 0 1px var(--halo-ring, transparent);
+}
+
+/* Keyboard focus: a single, consistent ring brighter than every fill, so focus
+   never hides inside a selection tint or a status well. */
+.fas-focus:focus-visible {
+  outline: 2px solid var(--fas-accent-ring);
+  outline-offset: 2px;
+}

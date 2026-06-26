@@ -1,0 +1,95 @@
+# ─────────────────────────────────────────────────────────────────────────
+# Dependencies
+# ─────────────────────────────────────────────────────────────────────────
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# ─────────────────────────────────────────────────────────────────────────
+# Build output (Next.js / bundlers)
+# ─────────────────────────────────────────────────────────────────────────
+/.next/
+/out/
+/build
+/dist
+.turbo
+.swc
+
+# ─────────────────────────────────────────────────────────────────────────
+# Environment & secrets  — NEVER commit real tokens/keys
+# Ignore every .env variant, but keep the tracked example.
+# ─────────────────────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ─────────────────────────────────────────────────────────────────────────
+# Client data — mapping CSVs hold client campaign→Page mappings.
+# Ignore ALL real per-account files (e.g. acme.csv, demo.csv, …) because
+# they contain client data; KEEP ONLY the non-sensitive example template.
+# (Negation must come after the broad ignore.)
+# ─────────────────────────────────────────────────────────────────────────
+/data/mapping/*.csv
+!/data/mapping/example.csv
+
+# Live discovery snapshots — real campaign names + Page IDs = client data.
+/data/discovery/
+
+# Per-account tag/classification files (store-group flag lists, etc.) = client data.
+/data/tags/
+
+# AI-copywriter training data (e.g. data/discovery/copy.xlsx) — never commit or
+# deploy. Spreadsheets anywhere under the repo are treated as local-only data.
+*.xlsx
+*.xls
+
+# ─────────────────────────────────────────────────────────────────────────
+# Internal docs + design mocks — kept local, never published.
+# The planning / spec / commercialization markdown under docs/, and the static
+# design mocks under design/ (imported by nothing, excluded in tsconfig), are
+# internal only. Trimmed from the public repo to keep it lean.
+# ─────────────────────────────────────────────────────────────────────────
+/docs/
+/design/
+
+# ─────────────────────────────────────────────────────────────────────────
+# Logs
+# ─────────────────────────────────────────────────────────────────────────
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# ─────────────────────────────────────────────────────────────────────────
+# Testing / coverage
+# ─────────────────────────────────────────────────────────────────────────
+/coverage
+*.lcov
+
+# ─────────────────────────────────────────────────────────────────────────
+# TypeScript / Next
+# ─────────────────────────────────────────────────────────────────────────
+*.tsbuildinfo
+next-env.d.ts
+
+# ─────────────────────────────────────────────────────────────────────────
+# Deploy / tooling caches
+# ─────────────────────────────────────────────────────────────────────────
+.vercel
+
+# ─────────────────────────────────────────────────────────────────────────
+# Editor / OS noise
+# ─────────────────────────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
