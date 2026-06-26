@@ -86,6 +86,7 @@ reads. The optional team login adds a few more (see [Team access](#team-access-o
 | `TEMPLATE_AD_NAME`        | no       | The ad name Dupe treats as each campaign's template. Defaults to `Template`.                  |
 | `ACCOUNTS_JSON`           | no       | JSON array of account configs. Overrides `config/accounts.ts` when set, so real account ids never touch the repo. |
 | `DISCOVERY_SOURCE`        | no       | `auto` (default), `snapshot`, `live`, or `mapping`. Forces which data source discovery reads from. |
+| `MAPPING_<SLUG>`          | no       | Store→Page mapping CSV for one account, supplied via env (e.g. `MAPPING_ACME`), for hosted deploys where `data/mapping/*.csv` isn't present. Value is the raw CSV text; wins over the file. |
 | `ANTHROPIC_API_KEY`       | no       | Powers the Generate Copy button. Without it, Generate Copy returns 503 and everything else works fine. |
 | `ANTHROPIC_COPY_MODEL`    | no       | Model used for Generate Copy. Defaults to `claude-sonnet-4-6`.                                |
 

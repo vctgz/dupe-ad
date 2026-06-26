@@ -382,6 +382,13 @@ function CreateResultView({ result }: { result: CreateAdsResponse }) {
         ) : null}
       </div>
 
+      {result.timedOut ? (
+        <p className="text-fas-12 text-status-mismatch">
+          Stopped at the time limit before finishing. {result.remaining?.length ?? 0} store
+          {(result.remaining?.length ?? 0) === 1 ? "" : "s"} not attempted — re-run to finish the rest.
+        </p>
+      ) : null}
+
       <ul className="flex max-h-56 flex-col divide-y divide-hairline overflow-y-auto">
         {result.results.map((r) => (
           <li key={r.campaignId} className="flex items-start gap-2.5 py-2">
@@ -473,7 +480,7 @@ export default function DuplicateModal({
   const [genError, setGenError] = useState<string | null>(null);
 
   // Live create (write) state. idle → confirm → creating.
-  const [phase, setPhase] = useState<"idle" | "confirm" | "creating">("idle");
+  const [phase, setPhase] = useState<"idle" | "creating">("idle");
   const [createResult, setCreateResult] = useState<CreateAdsResponse | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
 
@@ -653,8 +660,8 @@ export default function DuplicateModal({
     }
   }
 
-  // LIVE WRITE — create the paused ads for real. Only reachable from the confirm
-  // step, only in create mode with write creds. Sends the uploaded image(s) so the
+  // LIVE WRITE — create the paused ads for real. Triggered by the primary button, only in
+  // create mode with write creds (canCreate gates it). Sends the uploaded image(s) so the
   // server can register the account-scoped image_hash and build a per-store creative.
   async function doCreate() {
     setPhase("creating");
@@ -948,9 +955,18 @@ export default function DuplicateModal({
           {createResult ? <CreateResultView result={createResult} /> : null}
         </div>
 
-        {/* Footer actions */}
-        {phase === "idle" ? (
-          <div className="flex shrink-0 items-center justify-end gap-2.5 border-t border-hairline px-5 py-4">
+        {/* Footer actions — one explicit step. Every ad is PAUSED (reversible), so no
+            separate confirm gate; the caption + count make the scale clear up front. */}
+        <div className="flex shrink-0 flex-col gap-2.5 border-t border-hairline px-5 py-4">
+          {isCreate ? (
+            <p className="text-fas-12 text-ink-muted">
+              Creates <span className="font-semibold text-ink">{n}</span> paused ad{n === 1 ? "" : "s"} across{" "}
+              <span className="font-semibold text-ink">{storeCount}</span> store{storeCount === 1 ? "" : "s"}. Each is
+              created <span className="font-semibold text-ink">PAUSED</span> — nothing goes live until you activate it
+              in Ads Manager.
+            </p>
+          ) : null}
+          <div className="flex items-center justify-end gap-2.5">
             {/* SECONDARY — the no-write dry-run. */}
             <button
               type="button"
@@ -972,10 +988,10 @@ export default function DuplicateModal({
                   ? `Preview new ad (${n})`
                   : `Preview duplication (${n})`}
             </button>
-            {/* PRIMARY — the live write. Gated on write creds + a complete form. */}
+            {/* PRIMARY — the live write, one click. Gated on write creds + a complete form. */}
             <button
               type="button"
-              onClick={() => setPhase("confirm")}
+              onClick={doCreate}
               disabled={!canCreate}
               title={
                 !isCreate
@@ -988,44 +1004,15 @@ export default function DuplicateModal({
               }
               className="fas-focus inline-flex items-center gap-2 rounded-fas-md bg-accent px-4 py-2 text-fas-13 font-semibold text-ink-on-accent transition-colors duration-[110ms] ease-fas hover:bg-accent-hover active:bg-accent-pressed disabled:cursor-not-allowed disabled:bg-surface-sunken disabled:text-ink-faint disabled:hover:bg-surface-sunken"
             >
-              <Plus size={14} strokeWidth={2} aria-hidden="true" />
-              Create paused ads
+              {phase === "creating" ? (
+                <RotateCw size={14} strokeWidth={2} aria-hidden="true" className="animate-spin" />
+              ) : (
+                <Plus size={14} strokeWidth={2} aria-hidden="true" />
+              )}
+              {phase === "creating" ? "Creating…" : `Create ${n} paused ad${n === 1 ? "" : "s"}`}
             </button>
           </div>
-        ) : (
-          // Confirm + creating: an explicit, deliberate gate before any live write.
-          <div className="flex shrink-0 flex-col gap-2.5 border-t border-hairline px-5 py-4">
-            <p className="text-fas-12 text-ink-muted">
-              Create <span className="font-semibold text-ink">{n}</span> paused ad{n === 1 ? "" : "s"} across{" "}
-              <span className="font-semibold text-ink">{storeCount}</span> store{storeCount === 1 ? "" : "s"}? Each is
-              created <span className="font-semibold text-ink">PAUSED</span> — nothing goes live until you activate it
-              in Ads Manager.
-            </p>
-            <div className="flex items-center justify-end gap-2.5">
-              <button
-                type="button"
-                onClick={() => setPhase("idle")}
-                disabled={phase === "creating"}
-                className="fas-focus rounded-fas-md border border-hairline bg-surface px-4 py-2 text-fas-13 font-semibold text-ink transition-colors hover:border-hairline-strong disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={doCreate}
-                disabled={phase === "creating"}
-                className="fas-focus inline-flex items-center gap-2 rounded-fas-md bg-accent px-4 py-2 text-fas-13 font-semibold text-ink-on-accent transition-colors duration-[110ms] ease-fas hover:bg-accent-hover active:bg-accent-pressed disabled:cursor-not-allowed disabled:bg-surface-sunken disabled:text-ink-faint disabled:hover:bg-surface-sunken"
-              >
-                {phase === "creating" ? (
-                  <RotateCw size={14} strokeWidth={2} aria-hidden="true" className="animate-spin" />
-                ) : (
-                  <Plus size={14} strokeWidth={2} aria-hidden="true" />
-                )}
-                {phase === "creating" ? "Creating…" : `Create ${n} paused ad${n === 1 ? "" : "s"}`}
-              </button>
-            </div>
-          </div>
-        )}
+        </div>
       </div>
     </div>
   );

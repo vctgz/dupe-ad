@@ -57,5 +57,14 @@ For each account, Dupe:
    from the API) so you catch wrong or missing Page bindings before any ad is
    created.
 
+## Supplying the mapping in production
+
+On a hosted deploy (e.g. Vercel) these CSVs are not present: they're git-ignored and
+excluded from the deploy bundle because they hold your data. Instead, set an env var
+`MAPPING_<SLUG>` (slug uppercased, non-alphanumerics replaced with `_`, e.g.
+`MAPPING_ACME`) whose value is the raw CSV text. It uses the exact same format, and wins
+over the on-disk file when present. This is how discovery and the Create flow resolve each
+store's Page in production.
+
 Only `example.csv` (a non-sensitive template) and this README are tracked in git.
 Your real per-account files are **git-ignored**, since they contain your data.

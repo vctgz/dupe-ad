@@ -173,34 +173,17 @@ function detectFormat(headerFields: string[]): MappingFormat | null {
  * Across all entries it also computes `sharedWith` (other codes pointing at the
  * same page id) and the `splitPageCodes` list (every code on a shared page).
  */
-export async function loadMappingFile(slug: string): Promise<LoadedMapping> {
-  const filePath = mappingPath(slug);
+/** Env var name carrying a slug's mapping CSV, e.g. "runnings" -> MAPPING_RUNNINGS. */
+function mappingEnvVar(slug: string): string {
+  return `MAPPING_${slug.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}`;
+}
 
-  // Stat first: reuse the parsed mapping when the file is unchanged. ENOENT (or
-  // any stat failure) falls through to readFile, preserving the existing
-  // empty-mapping / error behavior exactly.
-  let statMtimeMs: number | null = null;
-  try {
-    const s = await stat(filePath);
-    statMtimeMs = s.mtimeMs;
-    const cached = mappingCache.get(filePath);
-    if (cached && cached.mtimeMs === statMtimeMs) {
-      return cached.value;
-    }
-  } catch {
-    // fall through to readFile
-  }
+// Parsed-mapping cache for the env-var source, keyed by slug; invalidated when the env
+// string changes so a redeploy with an edited MAPPING_<SLUG> is always picked up.
+const envMappingCache = new Map<string, { raw: string; value: LoadedMapping }>();
 
-  let raw: string;
-  try {
-    raw = await readFile(filePath, "utf8");
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-      return { format: null, entries: [], splitPageCodes: [] };
-    }
-    throw err;
-  }
-
+/** Parse raw mapping CSV text (either layout) into a normalized LoadedMapping. */
+function parseMappingCsv(raw: string): LoadedMapping {
   const parsed = Papa.parse<Record<string, string>>(raw, {
     header: true,
     skipEmptyLines: true,
@@ -235,7 +218,7 @@ export async function loadMappingFile(slug: string): Promise<LoadedMapping> {
 
     if (!code && !page) continue;
 
-    const dedupeKey = `${code} ${page ?? ""}`;
+    const dedupeKey = `${code} ${page ?? ""}`;
     if (seen.has(dedupeKey)) continue;
     seen.add(dedupeKey);
 
@@ -249,7 +232,58 @@ export async function loadMappingFile(slug: string): Promise<LoadedMapping> {
   }
 
   const splitPageCodes = annotateSharedPages(entries);
-  const result: LoadedMapping = { format, entries, splitPageCodes };
+  return { format, entries, splitPageCodes };
+}
+
+export async function loadMappingFile(slug: string): Promise<LoadedMapping> {
+  // Env-var CSV wins: lets a hosted deployment supply the store->page mapping without
+  // committing client data (the CSVs are gitignored/vercelignored). Set MAPPING_<SLUG>
+  // (e.g. MAPPING_RUNNINGS) to the raw CSV text.
+  const envCsv = process.env[mappingEnvVar(slug)];
+  if (envCsv && envCsv.trim().length > 0) {
+    const cached = envMappingCache.get(slug);
+    if (cached && cached.raw === envCsv) return cached.value;
+    const value = parseMappingCsv(envCsv);
+    // A non-blank env var that parses to nothing is an operator mistake (wrong headers),
+    // not "no mapping" — fail loud rather than silently mapping zero stores.
+    if (value.format === null && value.entries.length === 0) {
+      throw new Error(
+        `${mappingEnvVar(slug)} is set but its CSV header matches neither layout ` +
+          `("Campaign Name","Link Object ID" or "store number","page_id").`,
+      );
+    }
+    envMappingCache.set(slug, { raw: envCsv, value });
+    return value;
+  }
+
+  const filePath = mappingPath(slug);
+
+  // Stat first: reuse the parsed mapping when the file is unchanged. ENOENT (or
+  // any stat failure) falls through to readFile, preserving the existing
+  // empty-mapping / error behavior exactly.
+  let statMtimeMs: number | null = null;
+  try {
+    const s = await stat(filePath);
+    statMtimeMs = s.mtimeMs;
+    const cached = mappingCache.get(filePath);
+    if (cached && cached.mtimeMs === statMtimeMs) {
+      return cached.value;
+    }
+  } catch {
+    // fall through to readFile
+  }
+
+  let raw: string;
+  try {
+    raw = await readFile(filePath, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return { format: null, entries: [], splitPageCodes: [] };
+    }
+    throw err;
+  }
+
+  const result = parseMappingCsv(raw);
 
   if (statMtimeMs !== null) {
     mappingCache.set(filePath, { mtimeMs: statMtimeMs, value: result });

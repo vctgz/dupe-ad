@@ -17,7 +17,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { getAccountBySlug } from "@/config/accounts";
-import { loadSnapshot } from "@/lib/discovery/snapshot";
+import { resolveDiscoveryResult } from "@/lib/discovery/resolve";
 import { loadLandingUrls } from "@/lib/mapping";
 import { authorizeAccount } from "@/lib/route-guard";
 import { LiveCredentialsError } from "@/lib/env";
@@ -30,9 +30,12 @@ import {
   uploadImage,
 } from "@/lib/meta/write";
 import type { ApiError } from "@/lib/types";
-import type { CampaignRow } from "@/lib/discovery/types";
+import type { CampaignRow, DiscoveryResult } from "@/lib/discovery/types";
 
 export const dynamic = "force-dynamic";
+// Live writes fan out serialized across many stores; give the function headroom beyond
+// Vercel's short default (60s is the Hobby ceiling; raise on Pro for very large batches).
+export const maxDuration = 60;
 
 // Meta call_to_action_type allow-list (mirrors the modal's CTA_OPTIONS). Anything
 // outside this set is rejected rather than forwarded to the Graph API.
@@ -79,6 +82,10 @@ export interface CreateAdsResponse {
   created: number;
   failed: number;
   results: CreateAdResultRow[];
+  /** True when the run hit its time budget before processing every selected store. */
+  timedOut?: boolean;
+  /** Campaign ids not yet processed when timedOut — re-run just these. */
+  remaining?: string[];
 }
 
 function isHttpUrl(value: string): boolean {
@@ -149,6 +156,38 @@ export async function POST(
     throw err;
   }
 
+  // Resolve each store's Page + IG identity + display name from the LIVE source — the
+  // same campaign-bearing data the table reads. Pinned to "live" so a DISCOVERY_SOURCE of
+  // "mapping"/"snapshot" can't hand back store-list rows (campaignId: null) that would make
+  // every store fail. resolveToken above already guaranteed live creds are present.
+  let discovery: DiscoveryResult;
+  try {
+    discovery = await resolveDiscoveryResult(account, "live");
+  } catch (err) {
+    if (err instanceof LiveCredentialsError) {
+      return NextResponse.json(
+        { error: "Live creation needs Meta credentials to read campaigns." },
+        { status: 503 },
+      );
+    }
+    const msg =
+      err instanceof MetaApiError
+        ? `Meta API error (${err.code ?? "?"}): ${err.message}`
+        : err instanceof Error
+          ? err.message
+          : "Could not load campaigns.";
+    return NextResponse.json({ error: `Could not load campaigns: ${msg}` }, { status: 502 });
+  }
+  const byId = new Map<string, CampaignRow>();
+  for (const r of discovery.rows) {
+    if (r.campaignId) byId.set(r.campaignId, r);
+  }
+
+  // Per-store landing pages from the mapping CSV's `url` column. When a store has
+  // one, its ad links there; otherwise it falls back to the single Destination URL
+  // from the modal (already validated as http(s) above).
+  const landingUrls = await loadLandingUrls(account.slug);
+
   // Pick one image (square preferred), decode it, and reject anything oversized.
   const chosen = images.find((i) => i.placement === "square") ?? images[0]!;
   const base64 = base64FromDataUrl(chosen.dataUrl);
@@ -159,7 +198,8 @@ export async function POST(
     return NextResponse.json({ error: "Image is too large (over ~7MB)." }, { status: 413 });
   }
 
-  // Upload the image ONCE (account-scoped hash, reused across every store).
+  // Upload the image ONCE (account-scoped hash, reused across every store). Done AFTER
+  // discovery so a discovery failure never leaves an orphan uploaded image.
   let imageHash: string;
   try {
     imageHash = await uploadImage(account, token, base64);
@@ -173,22 +213,20 @@ export async function POST(
     return NextResponse.json({ error: `Could not upload the image: ${msg}` }, { status: 502 });
   }
 
-  // Snapshot supplies each store's Page + IG identity + display name.
-  const snapshot = await loadSnapshot(account);
-  const byId = new Map<string, CampaignRow>();
-  for (const r of snapshot.rows) {
-    if (r.campaignId) byId.set(r.campaignId, r);
-  }
-
-  // Per-store landing pages from the mapping CSV's `url` column. When a store has
-  // one, its ad links there; otherwise it falls back to the single Destination URL
-  // from the modal (already validated as http(s) above).
-  const landingUrls = await loadLandingUrls(account.slug);
-
   // SERIALIZE writes within the account (rate-limit safety, #8). Per-store results.
+  // A wall-clock budget stops the loop before the function's maxDuration so we always
+  // RETURN the results so far (with timedOut + remaining) instead of dying with no body —
+  // the operator sees which stores succeeded and can re-run only the rest.
   const wanted = [...new Set(campaignIds)];
   const results: CreateAdResultRow[] = [];
+  const startedAt = Date.now();
+  const BUDGET_MS = 50_000;
+  let timedOut = false;
   for (const campaignId of wanted) {
+    if (Date.now() - startedAt > BUDGET_MS) {
+      timedOut = true;
+      break;
+    }
     const row = byId.get(campaignId);
     const storeCode = row?.storeCode ?? null;
     const campaignName = row?.campaignName ?? "(unknown campaign)";
@@ -243,10 +281,13 @@ export async function POST(
   }
 
   const created = results.filter((r) => r.ok).length;
+  const processed = new Set(results.map((r) => r.campaignId));
   return NextResponse.json({
     count: results.length,
     created,
     failed: results.length - created,
     results,
+    timedOut,
+    remaining: timedOut ? wanted.filter((id) => !processed.has(id)) : [],
   });
 }

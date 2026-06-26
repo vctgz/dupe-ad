@@ -8,29 +8,13 @@
 //
 // With only APP_ACCESS_PASSCODE set this resolves to SNAPSHOT for every account, so
 // the app renders the real on-disk discovery with no Meta token.
-import { access } from "node:fs/promises";
-import path from "node:path";
 import { NextRequest, NextResponse } from "next/server";
 import { getAccountBySlug } from "@/config/accounts";
-import { loadLandingUrls } from "@/lib/mapping";
-import { getEnv, hasLiveCredentials, LiveCredentialsError } from "@/lib/env";
-import { loadSnapshot } from "@/lib/discovery/snapshot";
-import { loadLive } from "@/lib/discovery/live";
-import { buildStoreList } from "@/lib/discovery/mappingView";
+import { hasLiveCredentials, LiveCredentialsError } from "@/lib/env";
+import { resolveDiscoveryResult } from "@/lib/discovery/resolve";
 import { MetaApiError } from "@/lib/meta/client";
 import { authorizeAccount } from "@/lib/route-guard";
-import type { DiscoverySource } from "@/lib/discovery/types";
 import type { ApiError, DiscoveryResponse } from "@/lib/types";
-
-/** True when data/discovery/<slug>.json exists on disk. */
-async function snapshotExists(slug: string): Promise<boolean> {
-  try {
-    await access(path.join(process.cwd(), "data", "discovery", `${slug}.json`));
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 export const dynamic = "force-dynamic";
 // Live discovery on a large account fans out across many paginated /ads calls, which
@@ -53,46 +37,11 @@ export async function GET(
     return NextResponse.json({ error: `Unknown account "${slug}"` }, { status: 400 });
   }
 
-  // Resolve the source: explicit ?source= overrides DISCOVERY_SOURCE; "auto" picks
-  // live (usable creds) -> snapshot (data/discovery/<slug>.json exists) -> mapping
-  // store-list (data/mapping/<slug>.csv). An account with a snapshot resolves to
-  // snapshot; an account with no token and no snapshot resolves to the mapping store-list.
-  const requested = (req.nextUrl.searchParams.get("source") ?? getEnv().DISCOVERY_SOURCE) as
-    | DiscoverySource
-    | "auto";
-  let source: DiscoverySource;
-  if (requested === "live" || requested === "snapshot" || requested === "mapping") {
-    source = requested;
-  } else if (hasLiveCredentials(account.tokenEnvVar)) {
-    source = "live";
-  } else if (await snapshotExists(account.slug)) {
-    source = "snapshot";
-  } else {
-    source = "mapping";
-  }
-
   try {
-    let result;
-    if (source === "live") result = await loadLive(account);
-    else if (source === "mapping") result = await buildStoreList(account.slug);
-    else result = await loadSnapshot(account);
-
-    // The live + store-list sources already attach landing URLs from the mapping.
-    // Snapshots are pre-computed and may predate the `url` column, so merge the
-    // current mapping's URLs onto a fresh rows copy (never mutate the cached
-    // snapshot) so the table shows them without regenerating the snapshot.
-    if (source === "snapshot") {
-      const landingUrls = await loadLandingUrls(account.slug);
-      if (landingUrls.size > 0) {
-        result = {
-          ...result,
-          rows: result.rows.map((r) => {
-            const u = r.storeCode ? landingUrls.get(r.storeCode) : undefined;
-            return u ? { ...r, url: u } : r;
-          }),
-        };
-      }
-    }
+    const result = await resolveDiscoveryResult(
+      account,
+      req.nextUrl.searchParams.get("source"),
+    );
 
     // Surface whether live ad creation is possible for this account (write token +
     // app creds present). Read-only snapshot mode → false.

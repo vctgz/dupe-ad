@@ -1,22 +1,26 @@
 // POST /api/duplicate/preview
-// DRY-RUN duplication planner. NO WRITES — produces no Meta calls of any kind.
-// Loads the SAME discovery snapshot the table renders, then for each selected
-// campaignId emits a plan row describing where a duplicated ad WOULD land (the
-// store's own resolved Page) and whether that target is ready.
+// DRY-RUN duplication planner. NO WRITES of any kind. It READS campaigns from the same
+// source the discovery table uses (a live Meta read in production), then for each selected
+// campaignId emits a plan row describing where a duplicated/new ad WOULD land (the store's
+// own resolved Page) and whether that target is ready.
 //
-// This is the read-only seam in front of the Phase 1 live write engine: the
-// modal previews the plan; nothing is created here.
+// This is the read-only seam in front of the live write engine: the modal previews the
+// plan; nothing is created here.
 //
 // Auth-protected exactly like the other JSON APIs (reuses the route guard).
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { getAccountBySlug } from "@/config/accounts";
-import { loadSnapshot } from "@/lib/discovery/snapshot";
+import { resolveDiscoveryResult } from "@/lib/discovery/resolve";
+import { hasLiveCredentials, LiveCredentialsError } from "@/lib/env";
+import { MetaApiError } from "@/lib/meta/client";
 import { authorizeAccount } from "@/lib/route-guard";
 import type { ApiError } from "@/lib/types";
-import type { CampaignRow } from "@/lib/discovery/types";
+import type { CampaignRow, DiscoveryResult } from "@/lib/discovery/types";
 
 export const dynamic = "force-dynamic";
+// Live discovery (in live mode) can fan out across paginated Meta calls; give headroom.
+export const maxDuration = 60;
 
 // The two ad-creator modes the dry run plans for:
 //   duplicate - clone an existing ad (by name) onto each store's own live Page.
@@ -205,9 +209,28 @@ export async function POST(
     );
   }
 
-  // Snapshot for now — the SAME source the discovery table reads. No live Meta
-  // calls of any kind here; this is a dry run.
-  const discovery = await loadSnapshot(account);
+  // Resolve the SAME source the discovery table reads. Pinned to "live" when creds exist
+  // so a DISCOVERY_SOURCE of "mapping"/"snapshot" can't hand back store-list rows
+  // (campaignId: null) that would make every selected campaign look "not found". This is a
+  // DRY RUN — it READS campaigns to build the plan but performs NO writes of any kind.
+  let discovery: DiscoveryResult;
+  try {
+    discovery = await resolveDiscoveryResult(
+      account,
+      hasLiveCredentials(account.tokenEnvVar) ? "live" : undefined,
+    );
+  } catch (err) {
+    if (err instanceof LiveCredentialsError) {
+      return NextResponse.json({ error: err.message }, { status: 503 });
+    }
+    const msg =
+      err instanceof MetaApiError
+        ? `Meta API error (${err.code ?? "?"}): ${err.message}`
+        : err instanceof Error
+          ? err.message
+          : "Could not load campaigns.";
+    return NextResponse.json({ error: `Could not load campaigns: ${msg}` }, { status: 502 });
+  }
 
   const byId = new Map<string, CampaignRow>();
   for (const r of discovery.rows) {
@@ -231,7 +254,7 @@ export async function POST(
         nameMatch: mode === "duplicate" ? "unverified" : null,
         nameNote: null,
         ready: false,
-        blockReason: "Campaign not found in the latest discovery snapshot — re-scan.",
+        blockReason: "Campaign not found in the latest discovery — re-scan.",
       });
       continue;
     }

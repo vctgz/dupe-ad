@@ -40,7 +40,9 @@ const EXAMPLE_ACCOUNTS: AdAccount[] = [
 const accountSchema = z.object({
   id: z.coerce.string().regex(/^\d+$/, "id must be a numeric ad account id (no act_ prefix)"),
   label: z.string().trim().min(1, "label is required"),
-  slug: z.string().trim().min(1, "slug is required"),
+  // Restrict to lowercase letters, digits, hyphens so the slug->MAPPING_<SLUG> /
+  // APP_PASSWORD_<SLUG> env-var derivation stays 1:1 (no two slugs collide on one var).
+  slug: z.string().trim().regex(/^[a-z0-9-]+$/, "slug must be lowercase letters, digits, and hyphens"),
   storeCodeDigits: z.coerce.number().int("storeCodeDigits must be an integer").min(1).max(15),
   tokenEnvVar: z.string().trim().min(1).optional(),
   passwordEnvVar: z.string().trim().min(1).optional(),
