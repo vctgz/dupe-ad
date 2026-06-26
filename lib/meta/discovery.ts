@@ -56,15 +56,28 @@ const AD_FIELDS =
 const AD_PAGE_SIZES = [50, 25, 10] as const;
 
 /**
- * Fetch all of an account's ads with nested creative, backing off to smaller page
- * sizes if Meta returns error #1 ("reduce the amount of data"). Any other error
- * propagates immediately.
+ * Fetch the account's TEMPLATE ads with nested creative, using a SERVER-SIDE name
+ * filter so Meta only returns template-named ads instead of every ad in the account.
+ * Dupe creates every ad PAUSED, so accounts accumulate thousands of ads over time;
+ * page detection only needs each campaign's Template ad, so this keeps the pull tiny
+ * (and avoids the 504 timeout from paging through everything). Backs off to smaller
+ * page sizes on Meta error #1; any other error propagates immediately.
  */
 async function getAdsResilient(actId: string, token: string): Promise<MetaAd[]> {
+  // Server-side filter: only ads whose name contains the configured Template name.
+  // The exact, case-insensitive match still runs in code (isTemplateAd) — this just
+  // shrinks Meta's response from "every ad" to "the template ads".
+  const filtering = JSON.stringify([
+    { field: "name", operator: "CONTAIN", value: templateNameConfigured() },
+  ]);
   let lastErr: unknown;
   for (const limit of AD_PAGE_SIZES) {
     try {
-      return await get<MetaAd>(`${actId}/ads`, { fields: AD_FIELDS, limit }, token);
+      return await get<MetaAd>(
+        `${actId}/ads`,
+        { fields: AD_FIELDS, limit, filtering },
+        token,
+      );
     } catch (err) {
       // Code 1 = the per-page query was too expensive; retry with a smaller page.
       if (err instanceof MetaApiError && err.code === 1) {
@@ -79,9 +92,14 @@ async function getAdsResilient(actId: string, token: string): Promise<MetaAd[]> 
   throw lastErr;
 }
 
+/** The configured Template ad name (original case), default "Template". */
+function templateNameConfigured(): string {
+  return (process.env.TEMPLATE_AD_NAME ?? "Template").trim();
+}
+
 /** Exact, case-insensitive Template-name match against TEMPLATE_AD_NAME (default "Template"). */
 function templateName(): string {
-  return (process.env.TEMPLATE_AD_NAME ?? "Template").trim().toLowerCase();
+  return templateNameConfigured().toLowerCase();
 }
 
 function isTemplateAd(ad: MetaAd, target: string): boolean {
