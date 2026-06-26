@@ -145,6 +145,12 @@ After deploying:
 
 `NODE_ENV=production` is set automatically on Vercel, so there is nothing to do there.
 
+In production, if you set Meta credentials but leave `AUTH_ENABLED` off, Dupe **refuses
+to start** so it can never run open with a live ad account. If you gate the app with
+something other than the built-in login (Vercel password, Cloudflare Access, an IP
+allowlist) and you intend to run open + live on purpose, set `ALLOW_UNAUTHENTICATED_LIVE=true`
+to tell that guard the choice is intentional.
+
 ## Scripts
 
 ```bash

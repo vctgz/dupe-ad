@@ -8,7 +8,7 @@
 //   - throws a typed MetaApiError parsed from Meta's error body.
 import "server-only";
 import { createHmac } from "node:crypto";
-import { getEnv, requireLiveEnv } from "@/lib/env";
+import { getEnv, requireLiveEnv, requireAppSecret } from "@/lib/env";
 import type { AdAccount } from "@/config/accounts";
 
 /** Typed Meta API error, parsed from Meta's `{ error: { ... } }` response body. */
@@ -55,10 +55,11 @@ export function resolveToken(account: AdAccount): string {
   return env.META_SYSTEM_USER_TOKEN!;
 }
 
-/** appsecret_proof = HMAC-SHA256(accessToken, app_secret), hex. */
+/** appsecret_proof = HMAC-SHA256(accessToken, app_secret), hex. Needs only the app
+ *  secret — NOT a token — so an account using its own token override still works. */
 function appSecretProof(accessToken: string): string {
-  const { META_APP_SECRET } = requireLiveEnv();
-  return createHmac("sha256", META_APP_SECRET).update(accessToken).digest("hex");
+  const secret = requireAppSecret();
+  return createHmac("sha256", secret).update(accessToken).digest("hex");
 }
 
 function baseUrl(): string {

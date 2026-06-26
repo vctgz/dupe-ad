@@ -11,6 +11,7 @@
 // (META_APP_SECRET, tokens, the passcode) that must never reach the browser.
 import "server-only";
 import { z } from "zod";
+import { AD_ACCOUNTS } from "@/config/accounts";
 
 const envSchema = z.object({
   // Pinned Graph API version. Don't float it — Meta changes field shapes.
@@ -89,7 +90,10 @@ export function getEnv(): Env {
     );
   }
 
-  cached = parsed.data;
+  // Validate into a LOCAL value and only cache AFTER every production guard passes.
+  // (If we cached first, a guard that throws would still have populated `cached`, so the
+  // next getEnv() call would short-circuit on `if (cached)` and skip the guard entirely.)
+  const data = parsed.data;
 
   // When the login portal is on in production, require a dedicated signing secret
   // of real length (the password-derived fallback in lib/auth is not acceptable
@@ -97,7 +101,7 @@ export function getEnv(): Env {
   if (
     process.env.NODE_ENV === "production" &&
     process.env.AUTH_ENABLED === "true" &&
-    (!nonEmpty(cached.APP_SESSION_SECRET) || cached.APP_SESSION_SECRET.trim().length < 32)
+    (!nonEmpty(data.APP_SESSION_SECRET) || data.APP_SESSION_SECRET.trim().length < 32)
   ) {
     throw new Error(
       "APP_SESSION_SECRET must be set to a strong value (32+ chars, e.g. `openssl rand -hex 32`) " +
@@ -113,9 +117,9 @@ export function getEnv(): Env {
     process.env.NODE_ENV === "production" &&
     process.env.AUTH_ENABLED !== "true" &&
     process.env.ALLOW_UNAUTHENTICATED_LIVE !== "true" &&
-    nonEmpty(cached.META_APP_ID) &&
-    nonEmpty(cached.META_APP_SECRET) &&
-    hasAnyLiveToken(cached.META_SYSTEM_USER_TOKEN)
+    nonEmpty(data.META_APP_ID) &&
+    nonEmpty(data.META_APP_SECRET) &&
+    hasAnyLiveToken(data.META_SYSTEM_USER_TOKEN)
   ) {
     throw new Error(
       "Refusing to start: Meta live credentials are configured but the login is off " +
@@ -125,6 +129,7 @@ export function getEnv(): Env {
     );
   }
 
+  cached = data;
   return cached;
 }
 
@@ -133,11 +138,17 @@ function nonEmpty(v: string | undefined): v is string {
 }
 
 /**
- * True when ANY usable Meta access token is configured: the shared system token, or a
- * per-account META_TOKEN_<SLUG> override. Used by the fail-closed live guard in getEnv().
+ * True when ANY usable Meta access token is configured: the shared system token, any
+ * configured account's `tokenEnvVar` (which can be an arbitrary name from ACCOUNTS_JSON),
+ * or a META_TOKEN_<SLUG> override. Used by the fail-closed live guard in getEnv() — it
+ * must see the SAME token surface as hasLiveCredentials() so the guard can't be bypassed
+ * by pointing an account at a non-conventionally-named token env var.
  */
 function hasAnyLiveToken(systemToken: string | undefined): boolean {
   if (nonEmpty(systemToken)) return true;
+  if (AD_ACCOUNTS.some((a) => a.tokenEnvVar && nonEmpty(process.env[a.tokenEnvVar]))) {
+    return true;
+  }
   return Object.entries(process.env).some(
     ([k, v]) => k.startsWith("META_TOKEN_") && nonEmpty(v),
   );
@@ -181,6 +192,19 @@ export function requireLiveEnv(tokenEnvVar?: string): LiveEnv {
     );
   }
   return { META_APP_ID: env.META_APP_ID!, META_APP_SECRET: env.META_APP_SECRET! };
+}
+
+/**
+ * Assert just the Meta app secret is present, for operations like appsecret_proof that
+ * need the secret but NOT any access token. Using requireLiveEnv() here would wrongly
+ * demand META_SYSTEM_USER_TOKEN even when an account supplies its own token override.
+ */
+export function requireAppSecret(): string {
+  const env = getEnv();
+  if (!nonEmpty(env.META_APP_SECRET)) {
+    throw new LiveCredentialsError("Live source needs Meta credentials: missing META_APP_SECRET.");
+  }
+  return env.META_APP_SECRET;
 }
 
 /** Thrown when a live request lacks Meta credentials — handlers map this to HTTP 400. */
