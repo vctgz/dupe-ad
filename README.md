@@ -176,7 +176,7 @@ Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Credits
 
-Dupe was vibe-coded by [Victor Gonzalez](https://github.com/vctgz) with a lot of help from Claude (Anthropic) in VS Code with [Claude Code](https://claude.com/claude-code) riding shotgun.
+Dupe was vibe-coded by [vctgz](https://github.com/vctgz) with a lot of help from Claude (Anthropic) in VS Code with [Claude Code](https://claude.com/claude-code) riding shotgun.
 
 ## License
 
