@@ -33,6 +33,10 @@ async function snapshotExists(slug: string): Promise<boolean> {
 }
 
 export const dynamic = "force-dynamic";
+// Live discovery on a large account fans out across many paginated /ads calls, which
+// can exceed Vercel's short default function timeout. Give it real headroom (60s is the
+// Hobby ceiling; Pro allows more if you ever need it).
+export const maxDuration = 60;
 
 export async function GET(
   req: NextRequest,
