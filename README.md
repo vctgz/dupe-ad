@@ -33,8 +33,8 @@ live until you review it. Optional AI-written copy is one click away.
 ## Quickstart
 
 ```bash
-git clone https://github.com/vctgz/dupe.git
-cd dupe
+git clone https://github.com/vctgz/dupe-ad.git
+cd dupe-ad
 ```
 
 ```bash
@@ -136,7 +136,7 @@ openssl rand -hex 32
 
 ## Deploy
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/vctgz/dupe)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/vctgz/dupe-ad)
 
 After deploying:
 
