@@ -6,7 +6,7 @@
 // docs/02-data-model.md §2. No DB in Phase 0 — we read live and return typed rows
 // in the SAME shape the snapshot loader produces, so both feed one reconciler.
 import "server-only";
-import { get, resolveToken } from "@/lib/meta/client";
+import { get, resolveToken, MetaApiError } from "@/lib/meta/client";
 import type { AdAccount } from "@/config/accounts";
 import type { PageIdSource } from "@/lib/discovery/types";
 import type { DiscoveredCampaign } from "@/lib/mapping";
@@ -29,7 +29,6 @@ interface MetaCreative {
     instagram_user_id?: string;
   };
   effective_object_story_id?: string;
-  asset_feed_spec?: unknown;
 }
 
 interface MetaAd {
@@ -42,10 +41,43 @@ interface MetaAd {
 }
 
 const CAMPAIGN_FIELDS = "id,name,objective,effective_status";
+// NOTE: deliberately NO asset_feed_spec — it's the entire dynamic-creative blob, the
+// single heaviest field Meta can return, and nothing here reads it. Requesting it
+// across a whole account is the classic trigger for Meta error #1 ("reduce the amount
+// of data you're asking for").
 const AD_FIELDS =
   "id,name,adset_id,campaign_id,effective_status," +
   "creative{id,name,object_story_spec{page_id,instagram_user_id}," +
-  "effective_object_story_id,asset_feed_spec}";
+  "effective_object_story_id}";
+
+// Page sizes to try for the account-level /ads pull, largest first. The nested
+// creative{} expansion makes this the heaviest call; large accounts can trip Meta
+// error #1 at big page sizes, so we back off to smaller pages before giving up.
+const AD_PAGE_SIZES = [50, 25, 10] as const;
+
+/**
+ * Fetch all of an account's ads with nested creative, backing off to smaller page
+ * sizes if Meta returns error #1 ("reduce the amount of data"). Any other error
+ * propagates immediately.
+ */
+async function getAdsResilient(actId: string, token: string): Promise<MetaAd[]> {
+  let lastErr: unknown;
+  for (const limit of AD_PAGE_SIZES) {
+    try {
+      return await get<MetaAd>(`${actId}/ads`, { fields: AD_FIELDS, limit }, token);
+    } catch (err) {
+      // Code 1 = the per-page query was too expensive; retry with a smaller page.
+      if (err instanceof MetaApiError && err.code === 1) {
+        lastErr = err;
+        // eslint-disable-next-line no-console
+        console.warn(`[meta] /ads too large at limit=${limit}; backing off`);
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr;
+}
 
 /** Exact, case-insensitive Template-name match against TEMPLATE_AD_NAME (default "Template"). */
 function templateName(): string {
@@ -128,12 +160,8 @@ export async function discoverAccount(
     token,
   );
 
-  // 2. Ads at the account level, one nested pass (paginated).
-  const ads = await get<MetaAd>(
-    `${actId}/ads`,
-    { fields: AD_FIELDS, limit: 200 },
-    token,
-  );
+  // 2. Ads at the account level, nested creative, paginated with adaptive page size.
+  const ads = await getAdsResilient(actId, token);
 
   // 3. Group ads by campaign_id.
   const adsByCampaign = new Map<string, MetaAd[]>();

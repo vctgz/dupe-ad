@@ -28,15 +28,38 @@ function clientIp(req: NextRequest): string {
   return "local";
 }
 
+// IPs that bypass the login throttle entirely. Set LOGIN_RATE_LIMIT_ALLOWLIST to a
+// comma-separated list (e.g. your own office/home IP) so the brute-force speed bump
+// never locks you out. Matched exactly against the IP the platform reports for the
+// request (see the `[login] rate-limited ip=` log line). Empty/unset -> nobody is exempt.
+function isRateLimitExempt(ip: string): boolean {
+  const raw = process.env.LOGIN_RATE_LIMIT_ALLOWLIST;
+  if (!raw) return false;
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .includes(ip);
+}
+
 export async function POST(req: NextRequest): Promise<NextResponse> {
-  // Throttle by client IP BEFORE doing any credential work.
-  const rlKey = `login:${clientIp(req)}`;
-  const rl = rateLimit(rlKey, LOGIN_LIMIT, LOGIN_WINDOW_MS);
-  if (!rl.ok) {
-    return NextResponse.json(
-      { error: "Too many sign-in attempts. Please wait and try again." },
-      { status: 429, headers: { "Retry-After": String(rl.retryAfterSec) } },
-    );
+  // Throttle by client IP BEFORE any credential work — unless this IP is allowlisted
+  // (e.g. your own office/home IP) so the brute-force speed bump never locks you out.
+  const ip = clientIp(req);
+  const exempt = isRateLimitExempt(ip);
+  const rlKey = `login:${ip}`;
+  if (!exempt) {
+    const rl = rateLimit(rlKey, LOGIN_LIMIT, LOGIN_WINDOW_MS);
+    if (!rl.ok) {
+      // Log the throttled IP so you can read it from Vercel's logs and add it to
+      // LOGIN_RATE_LIMIT_ALLOWLIST if it's yours.
+      // eslint-disable-next-line no-console
+      console.warn(`[login] rate-limited ip=${ip}`);
+      return NextResponse.json(
+        { error: "Too many sign-in attempts. Please wait and try again." },
+        { status: 429, headers: { "Retry-After": String(rl.retryAfterSec) } },
+      );
+    }
   }
 
   let client = "";
@@ -58,7 +81,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
   }
 
   // A legit login clears this IP's throttle so an honest fat-finger never locks out.
-  rateLimitReset(rlKey);
+  if (!exempt) rateLimitReset(rlKey);
 
   const res = NextResponse.json({ ok: true, slug });
   res.cookies.set({
