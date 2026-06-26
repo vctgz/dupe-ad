@@ -153,6 +153,12 @@ function planRow(
 export async function POST(
   req: NextRequest,
 ): Promise<NextResponse<DuplicatePreviewResponse | ApiError>> {
+  // Reject oversized bodies before buffering (campaignIds + small creative only).
+  const contentLength = Number(req.headers.get("content-length") ?? "0");
+  if (Number.isFinite(contentLength) && contentLength > 256_000) {
+    return NextResponse.json({ error: "Request body too large." }, { status: 413 });
+  }
+
   let json: unknown;
   try {
     json = await req.json();

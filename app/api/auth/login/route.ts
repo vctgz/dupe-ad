@@ -43,6 +43,12 @@ function isRateLimitExempt(ip: string): boolean {
 }
 
 export async function POST(req: NextRequest): Promise<NextResponse> {
+  // Reject oversized bodies up front — login carries only { client, password }.
+  const contentLength = Number(req.headers.get("content-length") ?? "0");
+  if (Number.isFinite(contentLength) && contentLength > 20_000) {
+    return NextResponse.json({ error: "Request body too large." }, { status: 413 });
+  }
+
   // Throttle by client IP BEFORE any credential work — unless this IP is allowlisted
   // (e.g. your own office/home IP) so the brute-force speed bump never locks you out.
   const ip = clientIp(req);

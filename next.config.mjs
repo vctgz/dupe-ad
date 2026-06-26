@@ -5,9 +5,13 @@
 // 'unsafe-inline' because Next injects inline bootstrap scripts and styles without
 // nonces; a nonce-based strict CSP is a future hardening, but this still blocks
 // loading scripts/objects/frames from any other origin.
+//
+// 'unsafe-eval' is only needed by Next's dev runtime (React Refresh / HMR). Drop it in
+// production builds so an XSS can't reach eval()/new Function().
+const isProd = process.env.NODE_ENV === "production";
 const csp = [
   "default-src 'self'",
-  "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+  `script-src 'self' 'unsafe-inline'${isProd ? "" : " 'unsafe-eval'"}`,
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob:",
   "font-src 'self' data:",

@@ -52,6 +52,11 @@ const envSchema = z.object({
   // signed-in user to one ad account; anything else leaves the app open.
   AUTH_ENABLED: z.string().optional(),
 
+  // Escape hatch for the fail-closed live guard: set "true" to allow running with live
+  // Meta credentials while AUTH_ENABLED is off in production (only if gated another way,
+  // e.g. Cloudflare Access). Otherwise that combination refuses to boot. See getEnv().
+  ALLOW_UNAUTHENTICATED_LIVE: z.string().optional(),
+
   // Which data source to use: "auto" (default) picks live when usable creds exist for
   // the account, else snapshot, else the mapping store-list; "snapshot"/"live"/"mapping"
   // force the source (mirrors the per-request ?source= values the discovery route accepts).
@@ -100,11 +105,42 @@ export function getEnv(): Env {
     );
   }
 
+  // Fail closed: never run live-write-capable AND unauthenticated in production. A deploy
+  // with Meta credentials but AUTH_ENABLED off would expose live ad discovery + creation to
+  // anyone who can reach it. Require the login, or an explicit opt-in for a deployment that
+  // is gated another way (e.g. Cloudflare Access, an IP allowlist).
+  if (
+    process.env.NODE_ENV === "production" &&
+    process.env.AUTH_ENABLED !== "true" &&
+    process.env.ALLOW_UNAUTHENTICATED_LIVE !== "true" &&
+    nonEmpty(cached.META_APP_ID) &&
+    nonEmpty(cached.META_APP_SECRET) &&
+    hasAnyLiveToken(cached.META_SYSTEM_USER_TOKEN)
+  ) {
+    throw new Error(
+      "Refusing to start: Meta live credentials are configured but the login is off " +
+        '(AUTH_ENABLED is not "true"), so live ad discovery and creation would be open to ' +
+        "anyone who can reach this deployment. Set AUTH_ENABLED=true, or — only if this app " +
+        'is gated another way (e.g. Cloudflare Access) — set ALLOW_UNAUTHENTICATED_LIVE=true.',
+    );
+  }
+
   return cached;
 }
 
 function nonEmpty(v: string | undefined): v is string {
   return typeof v === "string" && v.trim().length > 0;
+}
+
+/**
+ * True when ANY usable Meta access token is configured: the shared system token, or a
+ * per-account META_TOKEN_<SLUG> override. Used by the fail-closed live guard in getEnv().
+ */
+function hasAnyLiveToken(systemToken: string | undefined): boolean {
+  if (nonEmpty(systemToken)) return true;
+  return Object.entries(process.env).some(
+    ([k, v]) => k.startsWith("META_TOKEN_") && nonEmpty(v),
+  );
 }
 
 /**

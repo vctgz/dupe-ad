@@ -52,8 +52,15 @@ function loadAccounts(): AdAccount[] {
           };
         });
       }
-    } catch {
-      // Malformed JSON: fall back to the shipped examples rather than crash.
+      throw new Error("ACCOUNTS_JSON must be a non-empty array.");
+    } catch (err) {
+      // In production a malformed override is a deploy error: fail loudly rather than
+      // silently serving the placeholder account. In dev, fall back to the examples.
+      if (process.env.NODE_ENV === "production") {
+        throw new Error(
+          `Invalid ACCOUNTS_JSON: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     }
   }
   return EXAMPLE_ACCOUNTS;
