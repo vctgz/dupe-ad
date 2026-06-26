@@ -73,6 +73,14 @@ function CountPill({
   );
 }
 
+// Friendlier labels for the data-source pill. A live pull reads as freshly "Updated";
+// snapshot/mapping keep their names.
+const SOURCE_LABEL: Record<DiscoverySource, string> = {
+  live: "Updated",
+  snapshot: "Snapshot",
+  mapping: "Mapping",
+};
+
 function SourcePill({
   source,
   fetchedAt,
@@ -98,7 +106,7 @@ function SourcePill({
         className={`h-1.5 w-1.5 shrink-0 rounded-fas-pill ${live ? "bg-health-ok" : "bg-ink-faint"}`}
         aria-hidden="true"
       />
-      <span className="uppercase tracking-caps-tight">{source}</span>
+      <span className="uppercase tracking-caps-tight">{SOURCE_LABEL[source]}</span>
       {stamp ? <span className="text-ink-faint">· {stamp}</span> : null}
     </span>
   );
