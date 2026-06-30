@@ -119,22 +119,63 @@ export async function createCreative(
   return res.id;
 }
 
-/** Create a PAUSED ad from a creative; returns the ad id (#7 — always PAUSED). */
+interface MetaPixel {
+  id: string;
+  is_unavailable?: boolean;
+}
+
+// In-process cache of the resolved tracking pixel per account slug (rarely changes).
+const pixelCache = new Map<string, string | null>();
+
+/**
+ * Resolve the conversion pixel to track website events against for an account: the
+ * account's configured `pixelId` when set, else the first AVAILABLE pixel on the account
+ * (act_<id>/adspixels). Returns null when the account has no pixel — the ad is then created
+ * WITHOUT website-event tracking rather than failing. Cached per account.
+ */
+export async function resolveTrackingPixelId(
+  account: AdAccount,
+  token: string,
+): Promise<string | null> {
+  if (account.pixelId && account.pixelId.trim().length > 0) {
+    return account.pixelId.trim();
+  }
+  const cached = pixelCache.get(account.slug);
+  if (cached !== undefined) return cached;
+  const pixels = await get<MetaPixel>(
+    `act_${account.id}/adspixels`,
+    { fields: "id,is_unavailable", limit: 50 },
+    token,
+  );
+  const usable = pixels.find((p) => p.id && p.is_unavailable !== true) ?? pixels[0] ?? null;
+  const pixelId = usable && usable.id ? usable.id : null;
+  pixelCache.set(account.slug, pixelId);
+  return pixelId;
+}
+
+/**
+ * Create a PAUSED ad from a creative; returns the ad id (#7 — always PAUSED). When a
+ * `pixelId` is supplied, the ad tracks website events against it (so the "Website events"
+ * box in the ad's Tracking section is checked); Meta auto-adds the rest of the tracking
+ * specs (onsite/page engagement).
+ */
 export async function createPausedAd(
   account: AdAccount,
   token: string,
-  args: { adsetId: string; creativeId: string; name: string },
+  args: { adsetId: string; creativeId: string; name: string; pixelId?: string | null },
 ): Promise<string> {
-  const res = await post<{ id?: string }>(
-    `act_${account.id}/ads`,
-    {
-      name: args.name,
-      adset_id: args.adsetId,
-      creative: { creative_id: args.creativeId },
-      status: "PAUSED",
-    },
-    token,
-  );
+  const params: Record<string, unknown> = {
+    name: args.name,
+    adset_id: args.adsetId,
+    creative: { creative_id: args.creativeId },
+    status: "PAUSED",
+  };
+  if (args.pixelId) {
+    params.tracking_specs = [
+      { "action.type": ["offsite_conversion"], fb_pixel: [args.pixelId] },
+    ];
+  }
+  const res = await post<{ id?: string }>(`act_${account.id}/ads`, params, token);
   if (!res.id) throw new Error("Ad creation did not return an id.");
   return res.id;
 }

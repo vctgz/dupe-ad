@@ -27,6 +27,7 @@ import {
   createCreative,
   createPausedAd,
   pickAdsetId,
+  resolveTrackingPixelId,
   uploadImage,
 } from "@/lib/meta/write";
 import type { ApiError } from "@/lib/types";
@@ -213,6 +214,19 @@ export async function POST(
     return NextResponse.json({ error: `Could not upload the image: ${msg}` }, { status: 502 });
   }
 
+  // Resolve the account's conversion pixel so created ads have "Website events" tracking
+  // checked. Best-effort: if it can't be resolved, ads still create (just without it).
+  let pixelId: string | null = null;
+  try {
+    pixelId = await resolveTrackingPixelId(account, token);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[create] could not resolve tracking pixel for ${account.slug}:`,
+      err instanceof Error ? err.message : err,
+    );
+  }
+
   // SERIALIZE writes within the account (rate-limit safety, #8). Per-store results.
   // A wall-clock budget stops the loop before the function's maxDuration so we always
   // RETURN the results so far (with timedOut + remaining) instead of dying with no body —
@@ -265,7 +279,7 @@ export async function POST(
         imageHash,
         creative: { adName, ...creative, link },
       });
-      const adId = await createPausedAd(account, token, { adsetId, creativeId, name: adName });
+      const adId = await createPausedAd(account, token, { adsetId, creativeId, name: adName, pixelId });
       results.push({ campaignId, storeCode, campaignName, ok: true, adId, pageId });
     } catch (err) {
       const msg =

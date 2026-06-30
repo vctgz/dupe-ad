@@ -11,6 +11,8 @@
 //                   (the join key against your store mapping), e.g. "0033 - ..." is 4
 // `tokenEnvVar`     optional per-account token env var; falls back to META_SYSTEM_USER_TOKEN
 // `passwordEnvVar`  optional; only used when AUTH_ENABLED=true (the login portal)
+// `pixelId`         optional conversion pixel id; created ads track website events against
+//                   it. Auto-resolved from the account's pixel when omitted.
 import { z } from "zod";
 
 export type AdAccount = {
@@ -20,6 +22,7 @@ export type AdAccount = {
   storeCodeDigits: number;
   tokenEnvVar?: string;
   passwordEnvVar?: string;
+  pixelId?: string;
 };
 
 // Example shipped with the repo. Replace with your own, or use ACCOUNTS_JSON.
@@ -46,6 +49,7 @@ const accountSchema = z.object({
   storeCodeDigits: z.coerce.number().int("storeCodeDigits must be an integer").min(1).max(15),
   tokenEnvVar: z.string().trim().min(1).optional(),
   passwordEnvVar: z.string().trim().min(1).optional(),
+  pixelId: z.coerce.string().regex(/^\d+$/, "pixelId must be a numeric pixel id").optional(),
 });
 
 /** Load accounts from ACCOUNTS_JSON when set, else the shipped examples. */
@@ -64,6 +68,7 @@ function loadAccounts(): AdAccount[] {
         storeCodeDigits: a.storeCodeDigits,
         tokenEnvVar: a.tokenEnvVar,
         passwordEnvVar: a.passwordEnvVar,
+        pixelId: a.pixelId,
       }));
     } catch (err) {
       // In production a malformed override is a deploy error: fail loudly rather than

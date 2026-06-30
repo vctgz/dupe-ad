@@ -70,6 +70,7 @@ Each account has:
 | `slug`           | Url-safe key for the account.                                                      |
 | `storeCodeDigits`| How many leading digits in a campaign name identify the store.                    |
 | `tokenEnvVar`    | Optional. Name of a per-account token override env var.                           |
+| `pixelId`        | Optional. Conversion pixel id; created ads track website events against it (auto-resolved from the account's pixel when omitted). |
 
 ### Environment variables
 
