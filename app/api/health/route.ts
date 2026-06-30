@@ -4,7 +4,7 @@
 // token is invalid/expired or the account is unassigned (alert on code 190, #9).
 import { NextRequest, NextResponse } from "next/server";
 import { getAccountBySlug } from "@/config/accounts";
-import { getObject, MetaApiError, resolveToken } from "@/lib/meta/client";
+import { getObject, MetaApiError, metaErrorToMessage, resolveToken } from "@/lib/meta/client";
 import { hasLiveCredentials, LiveCredentialsError } from "@/lib/env";
 import { authorizeAccount } from "@/lib/route-guard";
 import type { ApiError, HealthResponse } from "@/lib/types";
@@ -75,7 +75,7 @@ export async function GET(
         message:
           err.code === 190
             ? "Token invalid or expired (190) — re-issue the System User token"
-            : `Meta API error (${err.code ?? "?"}): ${err.message}`,
+            : metaErrorToMessage(err),
       };
       // 200 with ok:false so the pill renders; the failure is in the payload.
       return NextResponse.json(body);

@@ -13,7 +13,7 @@ import { z } from "zod";
 import { getAccountBySlug } from "@/config/accounts";
 import { resolveDiscoveryResult } from "@/lib/discovery/resolve";
 import { hasLiveCredentials, LiveCredentialsError } from "@/lib/env";
-import { MetaApiError, resolveToken } from "@/lib/meta/client";
+import { MetaApiError, metaErrorToMessage, resolveToken } from "@/lib/meta/client";
 import { fetchAdsetsByCampaign, pickAdsetFromList } from "@/lib/meta/write";
 import { authorizeAccount } from "@/lib/route-guard";
 import type { ApiError } from "@/lib/types";
@@ -247,7 +247,7 @@ export async function POST(
     }
     const msg =
       err instanceof MetaApiError
-        ? `Meta API error (${err.code ?? "?"}): ${err.message}`
+        ? metaErrorToMessage(err)
         : err instanceof Error
           ? err.message
           : "Could not load campaigns.";

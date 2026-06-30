@@ -37,6 +37,23 @@ export class MetaApiError extends Error {
   }
 }
 
+/** Meta error codes that mean "you are being rate limited" (per-user, per-app, BUC). */
+const RATE_LIMIT_CODES = new Set([
+  4, 17, 32, 613, 80000, 80001, 80002, 80003, 80004, 80005, 80006, 80008, 80009, 80014,
+]);
+
+/**
+ * A user-facing message for a MetaApiError. Rate-limit codes (e.g. 17 "User request limit
+ * reached") get a clear, actionable line instead of the raw text; everything else shows
+ * the code + Meta's message.
+ */
+export function metaErrorToMessage(err: MetaApiError): string {
+  if (err.code != null && RATE_LIMIT_CODES.has(err.code)) {
+    return "Meta's API rate limit was reached — please wait a minute and try again.";
+  }
+  return `Meta API error (${err.code ?? "?"}): ${err.message}`;
+}
+
 /**
  * Resolve the access token for an account: prefer the account's `tokenEnvVar`
  * when it is set AND non-empty; otherwise fall back to META_SYSTEM_USER_TOKEN.

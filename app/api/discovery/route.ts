@@ -12,7 +12,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getAccountBySlug } from "@/config/accounts";
 import { hasLiveCredentials, LiveCredentialsError } from "@/lib/env";
 import { resolveDiscoveryResult } from "@/lib/discovery/resolve";
-import { MetaApiError } from "@/lib/meta/client";
+import { MetaApiError, metaErrorToMessage } from "@/lib/meta/client";
 import { authorizeAccount } from "@/lib/route-guard";
 import type { ApiError, DiscoveryResponse } from "@/lib/types";
 
@@ -41,6 +41,7 @@ export async function GET(
     const result = await resolveDiscoveryResult(
       account,
       req.nextUrl.searchParams.get("source"),
+      { forceFresh: req.nextUrl.searchParams.get("refresh") === "1" },
     );
 
     // Surface whether live ad creation is possible for this account (write token +
@@ -58,7 +59,7 @@ export async function GET(
         `[discovery] Meta API error for ${account.slug}: code=${err.code} subcode=${err.subcode} type=${err.type} http=${err.httpStatus} trace=${err.fbtraceId} — ${err.message}`,
       );
       return NextResponse.json(
-        { error: `Meta API error (${err.code ?? "?"}): ${err.message}` },
+        { error: metaErrorToMessage(err) },
         { status: 502 },
       );
     }

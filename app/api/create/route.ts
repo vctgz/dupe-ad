@@ -21,7 +21,7 @@ import { resolveDiscoveryResult } from "@/lib/discovery/resolve";
 import { loadLandingUrls } from "@/lib/mapping";
 import { authorizeAccount } from "@/lib/route-guard";
 import { LiveCredentialsError } from "@/lib/env";
-import { MetaApiError, resolveToken } from "@/lib/meta/client";
+import { MetaApiError, metaErrorToMessage, resolveToken } from "@/lib/meta/client";
 import {
   base64FromDataUrl,
   createCreative,
@@ -178,7 +178,7 @@ export async function POST(
     }
     const msg =
       err instanceof MetaApiError
-        ? `Meta API error (${err.code ?? "?"}): ${err.message}`
+        ? metaErrorToMessage(err)
         : err instanceof Error
           ? err.message
           : "Could not load campaigns.";
@@ -212,7 +212,7 @@ export async function POST(
   } catch (err) {
     const msg =
       err instanceof MetaApiError
-        ? `Meta API error (${err.code ?? "?"}): ${err.message}`
+        ? metaErrorToMessage(err)
         : err instanceof Error
           ? err.message
           : "Image upload failed";
@@ -241,7 +241,7 @@ export async function POST(
   } catch (err) {
     const msg =
       err instanceof MetaApiError
-        ? `Meta API error (${err.code ?? "?"}): ${err.message}`
+        ? metaErrorToMessage(err)
         : err instanceof Error
           ? err.message
           : "Could not load ad sets.";
@@ -309,7 +309,7 @@ export async function POST(
     } catch (err) {
       const msg =
         err instanceof MetaApiError
-          ? `Meta API error (${err.code ?? "?"}): ${err.message}`
+          ? metaErrorToMessage(err)
           : err instanceof Error
             ? err.message
             : "Create failed";

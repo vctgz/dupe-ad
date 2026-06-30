@@ -56,11 +56,13 @@ export default function Dashboard({
   // The modal launches in one of two modes; null means closed.
   const [modalMode, setModalMode] = useState<"duplicate" | "create" | null>(null);
 
-  const load = useCallback(async (slug: string) => {
+  const load = useCallback(async (slug: string, refresh = false) => {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`/api/discovery?account=${encodeURIComponent(slug)}`);
+      const res = await fetch(
+        `/api/discovery?account=${encodeURIComponent(slug)}${refresh ? "&refresh=1" : ""}`,
+      );
       if (!res.ok) {
         const body = (await res.json().catch(() => ({}))) as { error?: string };
         throw new Error(body.error ?? `Discovery failed (HTTP ${res.status})`);
@@ -262,7 +264,7 @@ export default function Dashboard({
           <h1 className="font-display text-fas-24 font-bold tracking-tight text-ink">{account.label}</h1>
           <button
             type="button"
-            onClick={() => load(activeSlug)}
+            onClick={() => load(activeSlug, true)}
             disabled={loading}
             className="fas-focus inline-flex items-center gap-2 rounded-fas-md border border-hairline bg-surface px-3.5 py-2 text-fas-13 font-semibold text-ink transition-colors hover:border-hairline-strong disabled:opacity-50"
           >

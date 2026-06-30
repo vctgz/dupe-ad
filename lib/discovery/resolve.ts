@@ -34,9 +34,17 @@ async function snapshotExists(slug: string): Promise<boolean> {
  * For the snapshot source, current mapping landing URLs are merged onto a fresh rows
  * copy (snapshots predate the `url` column).
  */
+// Short-TTL cache of LIVE discovery per account. A single user flow (table load -> open
+// modal -> preview -> create, plus the odd re-scan) otherwise re-pulls the whole account
+// from Meta several times and trips its per-user rate limit (error 17). Re-scan passes
+// forceFresh to bypass this; everything else reuses the recent pull.
+const LIVE_TTL_MS = 90_000;
+const liveCache = new Map<string, { at: number; result: DiscoveryResult }>();
+
 export async function resolveDiscoveryResult(
   account: AdAccount,
   sourceOverride?: string | null,
+  opts?: { forceFresh?: boolean },
 ): Promise<DiscoveryResult> {
   const requested = (sourceOverride ?? getEnv().DISCOVERY_SOURCE) as
     | DiscoverySource
@@ -54,9 +62,19 @@ export async function resolveDiscoveryResult(
   }
 
   let result: DiscoveryResult;
-  if (source === "live") result = await loadLive(account);
-  else if (source === "mapping") result = await buildStoreList(account.slug);
-  else result = await loadSnapshot(account);
+  if (source === "live") {
+    const cached = liveCache.get(account.slug);
+    if (!opts?.forceFresh && cached && Date.now() - cached.at < LIVE_TTL_MS) {
+      result = cached.result;
+    } else {
+      result = await loadLive(account);
+      liveCache.set(account.slug, { at: Date.now(), result });
+    }
+  } else if (source === "mapping") {
+    result = await buildStoreList(account.slug);
+  } else {
+    result = await loadSnapshot(account);
+  }
 
   // Snapshots are pre-computed and may predate the mapping's `url` column, so merge the
   // current mapping's landing URLs onto a fresh rows copy (never mutate the cached one).
