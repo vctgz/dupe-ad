@@ -53,25 +53,69 @@ interface MetaAdset {
   id: string;
   name?: string;
   effective_status?: string;
+  campaign_id?: string;
+}
+
+/** Result of resolving which ad set a new ad should go into. */
+export type AdsetPick =
+  | { id: string; name: string }
+  | { id: null; reason: "no-adsets" | "name-not-found" };
+
+/**
+ * Fetch ALL ad sets in an account in one paginated pull and group them by campaign id.
+ * One account-level read is far cheaper than an /adsets call per campaign when creating
+ * (or previewing) across many stores.
+ */
+export async function fetchAdsetsByCampaign(
+  token: string,
+  accountId: string,
+): Promise<Map<string, MetaAdset[]>> {
+  const adsets = await get<MetaAdset>(
+    `act_${accountId}/adsets`,
+    { fields: "id,name,effective_status,campaign_id", limit: 200 },
+    token,
+  );
+  const byCampaign = new Map<string, MetaAdset[]>();
+  for (const a of adsets) {
+    if (!a.campaign_id) continue;
+    const list = byCampaign.get(a.campaign_id);
+    if (list) list.push(a);
+    else byCampaign.set(a.campaign_id, [a]);
+  }
+  return byCampaign;
+}
+
+/** ARCHIVED/DELETED ad sets can't run, so we never publish into them. */
+const NON_DELIVERABLE_ADSET = new Set(["ARCHIVED", "DELETED"]);
+function isDeliverableAdset(a: MetaAdset): boolean {
+  return !NON_DELIVERABLE_ADSET.has((a.effective_status ?? "").toUpperCase());
+}
+function preferActive(adsets: MetaAdset[]): MetaAdset {
+  return adsets.find((a) => (a.effective_status ?? "").toUpperCase() === "ACTIVE") ?? adsets[0]!;
 }
 
 /**
- * Pick an ad set under a campaign to attach the new ad to. An ad MUST live in an
- * ad set (there is no page/ad-set-level page field — #2). Prefer an ACTIVE set,
- * else the first. Returns null when the campaign has no ad set (reported per-store).
+ * Pick which ad set a new ad goes into, from a campaign's ad sets. Only ever considers
+ * DELIVERABLE ad sets (an account-level /adsets read includes ARCHIVED ones, which would
+ * never run). With `adsetName`, match it by EXACT (case-insensitive) name, preferring an
+ * ACTIVE one when several share the name; without, prefer an ACTIVE set, else the first
+ * deliverable. Returns a `reason` when nothing usable matches so callers can message
+ * precisely. An ad MUST live in an ad set (there is no page/ad-set-level page field — #2).
  */
-export async function pickAdsetId(
-  token: string,
-  campaignId: string,
-): Promise<string | null> {
-  const adsets = await get<MetaAdset>(
-    `${campaignId}/adsets`,
-    { fields: "id,name,effective_status", limit: 100 },
-    token,
-  );
-  if (adsets.length === 0) return null;
-  const active = adsets.find((a) => (a.effective_status ?? "").toUpperCase() === "ACTIVE");
-  return (active ?? adsets[0]!).id;
+export function pickAdsetFromList(adsets: MetaAdset[], adsetName?: string): AdsetPick {
+  if (adsets.length === 0) return { id: null, reason: "no-adsets" };
+  const usable = adsets.filter(isDeliverableAdset);
+  const want = (adsetName ?? "").trim();
+  if (want) {
+    const target = want.toLowerCase();
+    const matches = usable.filter((a) => (a.name ?? "").trim().toLowerCase() === target);
+    if (matches.length === 0) return { id: null, reason: "name-not-found" };
+    const chosen = preferActive(matches);
+    return { id: chosen.id, name: chosen.name ?? "" };
+  }
+  if (usable.length === 0) return { id: null, reason: "no-adsets" };
+  const chosen = preferActive(usable);
+  return { id: chosen.id, name: chosen.name ?? "" };
 }
 
 /**

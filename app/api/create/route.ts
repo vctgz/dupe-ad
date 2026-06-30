@@ -26,7 +26,8 @@ import {
   base64FromDataUrl,
   createCreative,
   createPausedAd,
-  pickAdsetId,
+  fetchAdsetsByCampaign,
+  pickAdsetFromList,
   resolveTrackingPixelId,
   uploadImage,
 } from "@/lib/meta/write";
@@ -52,6 +53,9 @@ const bodySchema = z.object({
   // Live writes currently support the from-scratch create flow only.
   mode: z.enum(["create", "duplicate"]).default("create"),
   adName: z.string().min(1).max(512),
+  // Optional: target only the ad set with this exact (case-insensitive) name in each
+  // campaign. Omitted -> the campaign's active (else first) ad set.
+  adsetName: z.string().trim().max(512).optional(),
   // Cap fan-out: bounds how many live writes a single request can trigger. Each
   // campaign is 2-3 serialized Graph calls, so 200 keeps a single run well-bounded.
   campaignIds: z.array(z.string().min(1).max(64)).min(1).max(200),
@@ -122,6 +126,7 @@ export async function POST(
   }
 
   const { accountSlug, mode, adName, campaignIds, creative, images } = parsed.data;
+  const adsetName = parsed.data.adsetName?.trim() || undefined;
 
   const authz = authorizeAccount(accountSlug);
   if (!authz.ok) {
@@ -227,6 +232,22 @@ export async function POST(
     );
   }
 
+  // Fetch the account's ad sets ONCE (grouped by campaign) so each store resolves its ad
+  // set locally — cheaper than an /adsets call per store, and required to match a specific
+  // ad-set name. A failure here is fatal (can't place ads without ad sets).
+  let adsetsByCampaign: Awaited<ReturnType<typeof fetchAdsetsByCampaign>>;
+  try {
+    adsetsByCampaign = await fetchAdsetsByCampaign(token, account.id);
+  } catch (err) {
+    const msg =
+      err instanceof MetaApiError
+        ? `Meta API error (${err.code ?? "?"}): ${err.message}`
+        : err instanceof Error
+          ? err.message
+          : "Could not load ad sets.";
+    return NextResponse.json({ error: `Could not load ad sets: ${msg}` }, { status: 502 });
+  }
+
   // SERIALIZE writes within the account (rate-limit safety, #8). Per-store results.
   // A wall-clock budget stops the loop before the function's maxDuration so we always
   // RETURN the results so far (with timedOut + remaining) instead of dying with no body —
@@ -253,14 +274,18 @@ export async function POST(
         });
         continue;
       }
-      const adsetId = await pickAdsetId(token, campaignId);
-      if (!adsetId) {
+      const pick = pickAdsetFromList(adsetsByCampaign.get(campaignId) ?? [], adsetName);
+      if (pick.id === null) {
         results.push({
           campaignId, storeCode, campaignName, ok: false,
-          error: "This campaign has no ad set to attach the ad to.",
+          error:
+            pick.reason === "name-not-found"
+              ? `No ad set named "${adsetName}" in this campaign.`
+              : "This campaign has no ad set to attach the ad to.",
         });
         continue;
       }
+      const adsetId = pick.id;
       // This store's landing page wins over the modal's fallback URL. A mapped URL
       // that isn't http(s) fails just this store, with a clear message, rather than
       // silently sending its ad to the fallback.

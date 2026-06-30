@@ -336,6 +336,21 @@ function PlanView({ plan }: { plan: DuplicatePreviewResponse }) {
                   <span className="text-status-mismatch">{r.blockReason}</span>
                 )}
               </div>
+              {r.adsetName && r.adsetMatch !== false ? (
+                <div className="mt-0.5 text-fas-11">
+                  {r.adsetMatch === true ? (
+                    <span className="inline-flex items-center gap-1 text-status-ok">
+                      <CheckCircle2 size={11} strokeWidth={2} aria-hidden="true" />
+                      Ad set: {r.adsetName}
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1 text-ink-muted">
+                      <Info size={11} strokeWidth={2} aria-hidden="true" />
+                      Ad set: {r.adsetName} (verified at create)
+                    </span>
+                  )}
+                </div>
+              ) : null}
               {plan.mode === "duplicate" && r.nameMatch != null ? (
                 <div className="mt-0.5 text-fas-11">
                   {r.nameMatch === true ? (
@@ -466,6 +481,7 @@ export default function DuplicateModal({
   const [headline, setHeadline] = useState("");
   const [subheadline, setSubheadline] = useState("");
   const [adName, setAdName] = useState("");
+  const [adsetName, setAdsetName] = useState("");
   const [link, setLink] = useState("");
   const [cta, setCta] = useState<string>("");
 
@@ -637,6 +653,7 @@ export default function DuplicateModal({
           campaignIds,
           mode,
           adName: isCreate ? undefined : adName,
+          adsetName: adsetName.trim() || undefined,
           link: link.trim() || undefined,
           creative: {
             primaryText,
@@ -684,6 +701,7 @@ export default function DuplicateModal({
           accountSlug,
           mode,
           adName: adName.trim(),
+          adsetName: adsetName.trim() || undefined,
           campaignIds,
           creative: {
             primaryText,
@@ -778,6 +796,21 @@ export default function DuplicateModal({
               onChange={(e) => setAdName(e.target.value)}
               placeholder={isCreate ? "Spring Sale" : "Template"}
               required
+              className="fas-focus w-full rounded-fas-md border border-hairline bg-surface px-3.5 py-2.5 text-fas-14 text-ink placeholder:text-ink-muted"
+            />
+          </Field>
+
+          <Field
+            label="Ad set name"
+            helper="Optional. Publish into the ad set with this exact name in each campaign. Blank uses the campaign's active ad set."
+            htmlFor="dm-adsetname"
+          >
+            <input
+              id="dm-adsetname"
+              type="text"
+              value={adsetName}
+              onChange={(e) => setAdsetName(e.target.value)}
+              placeholder="e.g. Bucket Sale"
               className="fas-focus w-full rounded-fas-md border border-hairline bg-surface px-3.5 py-2.5 text-fas-14 text-ink placeholder:text-ink-muted"
             />
           </Field>

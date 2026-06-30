@@ -13,7 +13,8 @@ import { z } from "zod";
 import { getAccountBySlug } from "@/config/accounts";
 import { resolveDiscoveryResult } from "@/lib/discovery/resolve";
 import { hasLiveCredentials, LiveCredentialsError } from "@/lib/env";
-import { MetaApiError } from "@/lib/meta/client";
+import { MetaApiError, resolveToken } from "@/lib/meta/client";
+import { fetchAdsetsByCampaign, pickAdsetFromList } from "@/lib/meta/write";
 import { authorizeAccount } from "@/lib/route-guard";
 import type { ApiError } from "@/lib/types";
 import type { CampaignRow, DiscoveryResult } from "@/lib/discovery/types";
@@ -44,6 +45,8 @@ const bodySchema = z.object({
   mode: z.enum(["duplicate", "create"]).default("duplicate"),
   /** Required in duplicate mode — the exact ad name to clone from each campaign. */
   adName: z.string().optional(),
+  /** Optional: target only the ad set with this exact name in each campaign. */
+  adsetName: z.string().trim().max(512).optional(),
   /** Destination URL — required in create mode, optional in duplicate mode. */
   link: z.string().optional(),
   creative: creativeSchema,
@@ -78,6 +81,13 @@ export interface DuplicatePlanRow {
   nameMatch: NameMatch | null;
   /** Duplicate mode only: human note about name verification. */
   nameNote: string | null;
+  /** The targeted ad set name (echoed), or null when none was specified. */
+  adsetName: string | null;
+  /**
+   * Whether the campaign has an ad set matching `adsetName`: true/false when verified
+   * live, "unverified" when it couldn't be checked, null when no name was specified.
+   */
+  adsetMatch: boolean | "unverified" | null;
   /** Ready only when a target Page resolved (+ a link in create mode). */
   ready: boolean;
   /** Human reason a row is not ready (null when ready). */
@@ -99,6 +109,8 @@ function planRow(
   mode: DuplicateMode,
   adName: string,
   link: string,
+  adsetName: string | null,
+  adsetMatch: boolean | "unverified" | null,
 ): DuplicatePlanRow {
   // create mode targets the store's mapped/live Page; duplicate mode targets the
   // live (actual) Page it would clone the source ad onto.
@@ -119,12 +131,19 @@ function planRow(
     }
   }
 
-  // Readiness: a resolved Page always required; create mode also needs a link.
-  const ready = mode === "create" ? hasPage && link.trim().length > 0 : hasPage;
+  // Readiness: a resolved Page always required; create mode also needs a link; and when an
+  // ad set name was targeted, the campaign must actually have it (false blocks; an
+  // "unverified" match does NOT block — it's confirmed at create time).
+  const adsetOk = adsetMatch !== false;
+  const ready = adsetOk && (mode === "create" ? hasPage && link.trim().length > 0 : hasPage);
 
   let blockReason: string | null = null;
   if (!ready) {
-    if (!hasPage) {
+    if (!adsetOk) {
+      blockReason = adsetName
+        ? `No ad set named "${adsetName}" in this campaign.`
+        : "No ad set found for this campaign.";
+    } else if (!hasPage) {
       blockReason =
         row.mappedPage != null
           ? "No live Page resolved from Meta for this campaign (mapping has one, the API returned none)."
@@ -149,6 +168,8 @@ function planRow(
     hasTemplateAd: row.hasTemplateAd,
     nameMatch,
     nameNote,
+    adsetName,
+    adsetMatch,
     ready,
     blockReason,
   };
@@ -180,6 +201,7 @@ export async function POST(
   const { accountSlug, campaignIds, mode } = parsed.data;
   const adName = (parsed.data.adName ?? "").trim();
   const link = (parsed.data.link ?? "").trim();
+  const adsetName = parsed.data.adsetName?.trim() || null;
 
   const authz = authorizeAccount(accountSlug);
   if (!authz.ok) {
@@ -238,9 +260,33 @@ export async function POST(
   }
 
   const wanted = new Set(campaignIds);
+
+  // When a specific ad set name is targeted, verify it per campaign (one account-level
+  // ad-sets pull) so the plan flags campaigns that lack it. Needs live creds; otherwise the
+  // match stays "unverified" (confirmed at create time). Best-effort: a fetch failure also
+  // leaves it unverified rather than blocking the whole preview.
+  let adsetMatchByCampaign: Map<string, boolean> | null = null;
+  if (adsetName && hasLiveCredentials(account.tokenEnvVar)) {
+    try {
+      const adsetsByCampaign = await fetchAdsetsByCampaign(resolveToken(account), account.id);
+      adsetMatchByCampaign = new Map();
+      for (const id of wanted) {
+        const found = pickAdsetFromList(adsetsByCampaign.get(id) ?? [], adsetName).id !== null;
+        adsetMatchByCampaign.set(id, found);
+      }
+    } catch {
+      adsetMatchByCampaign = null;
+    }
+  }
+
   const rows: DuplicatePlanRow[] = [];
   for (const id of wanted) {
     const row = byId.get(id);
+    const adsetMatch: boolean | "unverified" | null = adsetName
+      ? adsetMatchByCampaign
+        ? adsetMatchByCampaign.get(id) ?? false
+        : "unverified"
+      : null;
     if (!row) {
       // Selected id no longer present in the snapshot — surface as a blocked row.
       rows.push({
@@ -253,12 +299,14 @@ export async function POST(
         hasTemplateAd: false,
         nameMatch: mode === "duplicate" ? "unverified" : null,
         nameNote: null,
+        adsetName: null,
+        adsetMatch: null,
         ready: false,
         blockReason: "Campaign not found in the latest discovery — re-scan.",
       });
       continue;
     }
-    rows.push(planRow(row, mode, adName, link));
+    rows.push(planRow(row, mode, adName, link, adsetName, adsetMatch));
   }
 
   // Sort: store code asc, blocked first within each so problems read at the top.
