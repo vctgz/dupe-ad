@@ -97,8 +97,8 @@ function preferActive(adsets: MetaAdset[]): MetaAdset {
 /**
  * Pick which ad set a new ad goes into, from a campaign's ad sets. Only ever considers
  * DELIVERABLE ad sets (an account-level /adsets read includes ARCHIVED ones, which would
- * never run). With `adsetName`, match it by EXACT (case-insensitive) name, preferring an
- * ACTIVE one when several share the name; without, prefer an ACTIVE set, else the first
+ * never run). With `adsetName`, match any ad set whose name CONTAINS it (case-insensitive),
+ * preferring an ACTIVE one when several match; without, prefer an ACTIVE set, else the first
  * deliverable. Returns a `reason` when nothing usable matches so callers can message
  * precisely. An ad MUST live in an ad set (there is no page/ad-set-level page field — #2).
  */
@@ -108,7 +108,7 @@ export function pickAdsetFromList(adsets: MetaAdset[], adsetName?: string): Adse
   const want = (adsetName ?? "").trim();
   if (want) {
     const target = want.toLowerCase();
-    const matches = usable.filter((a) => (a.name ?? "").trim().toLowerCase() === target);
+    const matches = usable.filter((a) => (a.name ?? "").trim().toLowerCase().includes(target));
     if (matches.length === 0) return { id: null, reason: "name-not-found" };
     const chosen = preferActive(matches);
     return { id: chosen.id, name: chosen.name ?? "" };

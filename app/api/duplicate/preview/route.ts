@@ -45,7 +45,7 @@ const bodySchema = z.object({
   mode: z.enum(["duplicate", "create"]).default("duplicate"),
   /** Required in duplicate mode — the exact ad name to clone from each campaign. */
   adName: z.string().optional(),
-  /** Optional: target only the ad set with this exact name in each campaign. */
+  /** Optional: target only ad sets whose name contains this in each campaign. */
   adsetName: z.string().trim().max(512).optional(),
   /** Destination URL — required in create mode, optional in duplicate mode. */
   link: z.string().optional(),
@@ -141,7 +141,7 @@ function planRow(
   if (!ready) {
     if (!adsetOk) {
       blockReason = adsetName
-        ? `No ad set named "${adsetName}" in this campaign.`
+        ? `No ad set matching "${adsetName}" in this campaign.`
         : "No ad set found for this campaign.";
     } else if (!hasPage) {
       blockReason =

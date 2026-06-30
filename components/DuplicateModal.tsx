@@ -802,7 +802,7 @@ export default function DuplicateModal({
 
           <Field
             label="Ad set name"
-            helper="Optional. Publish into the ad set with this exact name in each campaign. Blank uses the campaign's active ad set."
+            helper="Optional. Publish into an ad set whose name contains this, in each campaign. Blank uses the campaign's active ad set."
             htmlFor="dm-adsetname"
           >
             <input

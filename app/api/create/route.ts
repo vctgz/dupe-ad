@@ -53,7 +53,7 @@ const bodySchema = z.object({
   // Live writes currently support the from-scratch create flow only.
   mode: z.enum(["create", "duplicate"]).default("create"),
   adName: z.string().min(1).max(512),
-  // Optional: target only the ad set with this exact (case-insensitive) name in each
+  // Optional: target only ad sets whose name CONTAINS this (case-insensitive) in each
   // campaign. Omitted -> the campaign's active (else first) ad set.
   adsetName: z.string().trim().max(512).optional(),
   // Cap fan-out: bounds how many live writes a single request can trigger. Each
@@ -280,7 +280,7 @@ export async function POST(
           campaignId, storeCode, campaignName, ok: false,
           error:
             pick.reason === "name-not-found"
-              ? `No ad set named "${adsetName}" in this campaign.`
+              ? `No ad set matching "${adsetName}" in this campaign.`
               : "This campaign has no ad set to attach the ad to.",
         });
         continue;
