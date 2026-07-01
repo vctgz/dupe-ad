@@ -21,15 +21,23 @@ import { resolveDiscoveryResult } from "@/lib/discovery/resolve";
 import { loadLandingUrls } from "@/lib/mapping";
 import { authorizeAccount } from "@/lib/route-guard";
 import { LiveCredentialsError } from "@/lib/env";
-import { MetaApiError, metaErrorToMessage, resolveToken } from "@/lib/meta/client";
+import {
+  MetaApiError,
+  getMetaUsage,
+  isRateLimitError,
+  metaErrorToMessage,
+  resolveToken,
+} from "@/lib/meta/client";
 import {
   base64FromDataUrl,
-  createCreative,
-  createPausedAd,
+  createCreativeAndPausedAd,
   fetchAdsetsByCampaign,
+  getVideoStatus,
   pickAdsetFromList,
   resolveTrackingPixelId,
   uploadImage,
+  type CarouselCardSpec,
+  type CreativeContent,
 } from "@/lib/meta/write";
 import type { ApiError } from "@/lib/types";
 import type { CampaignRow, DiscoveryResult } from "@/lib/discovery/types";
@@ -48,29 +56,102 @@ const CTA_TYPES = [
   "REQUEST_TIME", "GET_SHOWTIMES", "LISTEN_NOW", "WATCH_MORE", "SAVE",
 ] as const;
 
-const bodySchema = z.object({
-  accountSlug: z.string().min(1),
-  // Live writes currently support the from-scratch create flow only.
-  mode: z.enum(["create", "duplicate"]).default("create"),
-  adName: z.string().min(1).max(512),
-  // Optional: target only ad sets whose name CONTAINS this (case-insensitive) in each
-  // campaign. Omitted -> the campaign's active (else first) ad set.
-  adsetName: z.string().trim().max(512).optional(),
-  // Cap fan-out: bounds how many live writes a single request can trigger. Each
-  // campaign is 2-3 serialized Graph calls, so 200 keeps a single run well-bounded.
-  campaignIds: z.array(z.string().min(1).max(64)).min(1).max(200),
-  creative: z.object({
-    primaryText: z.string().min(1).max(2000),
-    headline: z.string().min(1).max(255),
-    subheadline: z.string().min(1).max(255),
-    link: z.string().min(1).max(2048),
-    cta: z.enum(CTA_TYPES).optional(),
-  }),
-  images: z
-    .array(z.object({ placement: z.string().max(32).optional(), dataUrl: z.string().min(1) }))
-    .min(1)
-    .max(5),
-});
+const bodySchema = z
+  .object({
+    accountSlug: z.string().min(1),
+    // Live writes currently support the from-scratch create flow only.
+    mode: z.enum(["create", "duplicate"]).default("create"),
+    // What the ad displays: a single image (default), a video, or a carousel.
+    // Video ads carry an already-registered, already-READY account-scoped video id
+    // from /api/video — raw video bytes never flow through this route (serverless
+    // body limits). Carousel ads carry 2-10 cards, each with its own image.
+    format: z.enum(["single", "video", "carousel"]).default("single"),
+    videoId: z.string().regex(/^\d{1,32}$/).optional(),
+    adName: z.string().min(1).max(512),
+    // Optional: target only ad sets whose name CONTAINS this (case-insensitive) in each
+    // campaign. Omitted -> the campaign's active (else first) ad set.
+    adsetName: z.string().trim().max(512).optional(),
+    // Cap fan-out: bounds how many live writes a single request can trigger. Each
+    // campaign is 2-3 serialized Graph calls, so 200 keeps a single run well-bounded.
+    campaignIds: z.array(z.string().min(1).max(64)).min(1).max(200),
+    creative: z.object({
+      primaryText: z.string().min(1).max(2000),
+      // Required for single/video (superRefine); unused by carousel (cards have their own).
+      headline: z.string().max(255).default(""),
+      subheadline: z.string().max(255).default(""),
+      link: z.string().min(1).max(2048),
+      cta: z.enum(CTA_TYPES).optional(),
+    }),
+    // Single: the ad image(s). Video: the REQUIRED thumbnail (square preferred).
+    // Carousel: unused (cards carry the images).
+    images: z
+      .array(z.object({ placement: z.string().max(32).optional(), dataUrl: z.string().min(1) }))
+      .max(5)
+      .default([]),
+    // Carousel cards, in display order. Per-card link is optional (falls back to the
+    // per-store destination).
+    cards: z
+      .array(
+        z.object({
+          dataUrl: z.string().min(1),
+          headline: z.string().min(1).max(255),
+          description: z.string().max(255).optional(),
+          link: z.string().max(2048).optional(),
+        }),
+      )
+      .min(2)
+      .max(10)
+      .optional(),
+  })
+  .superRefine((val, ctx) => {
+    if (val.format !== "carousel") {
+      if (val.images.length === 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["images"],
+          message:
+            val.format === "video" ? "A thumbnail image is required." : "An image is required.",
+        });
+      }
+      for (const [field, label] of [
+        ["headline", "A headline"],
+        ["subheadline", "A subheadline"],
+      ] as const) {
+        if (val.creative[field].trim().length === 0) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ["creative", field],
+            message: `${label} is required.`,
+          });
+        }
+      }
+    }
+    if (val.format === "video") {
+      if (!val.videoId) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["videoId"],
+          message: "A registered videoId is required for video ads.",
+        });
+      }
+      // video_data has no top-level link field; the destination lives only in the
+      // call_to_action, so "no button" cannot work for video.
+      if (!val.creative.cta || val.creative.cta === "NO_BUTTON") {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["creative", "cta"],
+          message: "Video ads need a call-to-action button to carry the destination link.",
+        });
+      }
+    }
+    if (val.format === "carousel" && !val.cards) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["cards"],
+        message: "Carousel ads need 2-10 cards.",
+      });
+    }
+  });
 
 export interface CreateAdResultRow {
   campaignId: string;
@@ -89,7 +170,11 @@ export interface CreateAdsResponse {
   results: CreateAdResultRow[];
   /** True when the run hit its time budget before processing every selected store. */
   timedOut?: boolean;
-  /** Campaign ids not yet processed when timedOut — re-run just these. */
+  /** True when Meta's rate limit stopped the run early (after an in-run retry). */
+  rateLimited?: boolean;
+  /** Meta's estimate (minutes) until access returns, when rateLimited and known. */
+  retryAfterMinutes?: number | null;
+  /** Campaign ids not yet processed when timedOut/rateLimited — re-run just these. */
   remaining?: string[];
 }
 
@@ -125,7 +210,8 @@ export async function POST(
     return NextResponse.json({ error: `Invalid request (${where})` }, { status: 400 });
   }
 
-  const { accountSlug, mode, adName, campaignIds, creative, images } = parsed.data;
+  const { accountSlug, mode, format, videoId, adName, campaignIds, creative, images, cards } =
+    parsed.data;
   const adsetName = parsed.data.adsetName?.trim() || undefined;
 
   const authz = authorizeAccount(accountSlug);
@@ -194,29 +280,128 @@ export async function POST(
   // from the modal (already validated as http(s) above).
   const landingUrls = await loadLandingUrls(account.slug);
 
-  // Pick one image (square preferred), decode it, and reject anything oversized.
-  const chosen = images.find((i) => i.placement === "square") ?? images[0]!;
-  const base64 = base64FromDataUrl(chosen.dataUrl);
-  if (!base64) {
-    return NextResponse.json({ error: "Image must be a base64 image data URL." }, { status: 400 });
-  }
-  if (base64.length > 10_000_000) {
-    return NextResponse.json({ error: "Image is too large (over ~7MB)." }, { status: 413 });
-  }
+  // Decode + upload the media this run needs — AFTER discovery so a discovery failure
+  // never leaves orphan uploads. Hashes/ids are account-scoped: uploaded ONCE here and
+  // reused across every store's page-bound creative. What each format needs:
+  //   single   — one image;
+  //   video    — the thumbnail image + a READY registered video;
+  //   carousel — one image per card (2-10).
+  let content: CreativeContent;
+  if (format === "carousel") {
+    const cardsIn = cards ?? [];
+    const decoded: { base64: string; headline: string; description?: string; link?: string }[] =
+      [];
+    for (const [i, card] of cardsIn.entries()) {
+      if (card.link && !isHttpUrl(card.link)) {
+        return NextResponse.json(
+          { error: `Card ${i + 1}: the link is not a valid http(s) URL.` },
+          { status: 400 },
+        );
+      }
+      const b64 = base64FromDataUrl(card.dataUrl);
+      if (!b64) {
+        return NextResponse.json(
+          { error: `Card ${i + 1}: the image must be a base64 image data URL.` },
+          { status: 400 },
+        );
+      }
+      if (b64.length > 10_000_000) {
+        return NextResponse.json(
+          { error: `Card ${i + 1}: the image is too large (over ~7MB).` },
+          { status: 413 },
+        );
+      }
+      decoded.push({
+        base64: b64,
+        headline: card.headline,
+        description: card.description,
+        link: card.link,
+      });
+    }
+    const cardSpecs: CarouselCardSpec[] = [];
+    try {
+      for (const d of decoded) {
+        cardSpecs.push({
+          imageHash: await uploadImage(account, token, d.base64),
+          headline: d.headline,
+          description: d.description,
+          link: d.link,
+        });
+      }
+    } catch (err) {
+      const msg =
+        err instanceof MetaApiError
+          ? metaErrorToMessage(err)
+          : err instanceof Error
+            ? err.message
+            : "Image upload failed";
+      return NextResponse.json(
+        { error: `Could not upload the image for card ${cardSpecs.length + 1}: ${msg}` },
+        { status: 502 },
+      );
+    }
+    content = { kind: "carousel", cards: cardSpecs };
+  } else {
+    // Pick one image (square preferred), decode it, and reject anything oversized.
+    // For video ads this image is the REQUIRED thumbnail.
+    const chosen = images.find((i) => i.placement === "square") ?? images[0]!;
+    const base64 = base64FromDataUrl(chosen.dataUrl);
+    if (!base64) {
+      return NextResponse.json(
+        { error: "Image must be a base64 image data URL." },
+        { status: 400 },
+      );
+    }
+    if (base64.length > 10_000_000) {
+      return NextResponse.json({ error: "Image is too large (over ~7MB)." }, { status: 413 });
+    }
 
-  // Upload the image ONCE (account-scoped hash, reused across every store). Done AFTER
-  // discovery so a discovery failure never leaves an orphan uploaded image.
-  let imageHash: string;
-  try {
-    imageHash = await uploadImage(account, token, base64);
-  } catch (err) {
-    const msg =
-      err instanceof MetaApiError
-        ? metaErrorToMessage(err)
-        : err instanceof Error
-          ? err.message
-          : "Image upload failed";
-    return NextResponse.json({ error: `Could not upload the image: ${msg}` }, { status: 502 });
+    let imageHash: string;
+    try {
+      imageHash = await uploadImage(account, token, base64);
+    } catch (err) {
+      const msg =
+        err instanceof MetaApiError
+          ? metaErrorToMessage(err)
+          : err instanceof Error
+            ? err.message
+            : "Image upload failed";
+      return NextResponse.json({ error: `Could not upload the image: ${msg}` }, { status: 502 });
+    }
+
+    // Video: confirm the registered video finished processing BEFORE any store
+    // writes — a not-ready video would fail every creative with an opaque Meta
+    // error. (superRefine guarantees videoId is present.)
+    if (format === "video" && videoId) {
+      try {
+        const status = await getVideoStatus(token, videoId);
+        if (status.status !== "ready") {
+          return NextResponse.json(
+            {
+              error:
+                status.status === "error"
+                  ? "Meta could not process this video — try uploading a different file."
+                  : "The video is still processing on Meta's side — try again in a moment.",
+            },
+            { status: 409 },
+          );
+        }
+      } catch (err) {
+        const msg =
+          err instanceof MetaApiError
+            ? metaErrorToMessage(err)
+            : err instanceof Error
+              ? err.message
+              : "Video check failed";
+        return NextResponse.json(
+          { error: `Could not verify the video: ${msg}` },
+          { status: 502 },
+        );
+      }
+      content = { kind: "video", videoId, thumbnailHash: imageHash };
+    } else {
+      content = { kind: "image", imageHash };
+    }
   }
 
   // Resolve the account's conversion pixel so created ads have "Website events" tracking
@@ -252,11 +437,21 @@ export async function POST(
   // A wall-clock budget stops the loop before the function's maxDuration so we always
   // RETURN the results so far (with timedOut + remaining) instead of dying with no body —
   // the operator sees which stores succeeded and can re-run only the rest.
+  //
+  // Rate-limit posture: pace proactively once the usage headers show >= PACE_AT percent
+  // utilization; on a rate-limit error retry the store ONCE after a short backoff; if Meta
+  // still says no, STOP (rateLimited + remaining) instead of burning every remaining store
+  // into the same wall — the modal offers a one-click resume.
   const wanted = [...new Set(campaignIds)];
   const results: CreateAdResultRow[] = [];
   const startedAt = Date.now();
   const BUDGET_MS = 50_000;
+  const PACE_AT = 85; // utilization percent where writes start slowing down
+  const RETRY_BACKOFF_MS = 5_000;
+  const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
   let timedOut = false;
+  let rateLimited = false;
+  let retryAfterMinutes: number | null = null;
   for (const campaignId of wanted) {
     if (Date.now() - startedAt > BUDGET_MS) {
       timedOut = true;
@@ -298,15 +493,56 @@ export async function POST(
         });
         continue;
       }
-      const creativeId = await createCreative(account, token, {
-        pageId,
-        instagramUserId: row?.instagramUserId ?? null,
-        imageHash,
-        creative: { adName, ...creative, link },
-      });
-      const adId = await createPausedAd(account, token, { adsetId, creativeId, name: adName, pixelId });
+      // Proactive pacing: when Meta's usage headers say we're near the wall, breathe
+      // between stores (inside the budget) instead of slamming into error 17.
+      const usage = getMetaUsage(account.id);
+      if (usage && usage.utilizationPct >= PACE_AT) {
+        const over = usage.utilizationPct - PACE_AT;
+        await sleep(Math.min(5_000, 2_000 + over * 200));
+        if (Date.now() - startedAt > BUDGET_MS) {
+          timedOut = true;
+          break;
+        }
+      }
+
+      // One batched round trip per store: creative + PAUSED ad as dependent Graph
+      // batch ops (both still count individually toward rate limits).
+      const writeOne = (): Promise<string> =>
+        createCreativeAndPausedAd(account, token, {
+          pageId,
+          instagramUserId: row?.instagramUserId ?? null,
+          content,
+          creative: { adName, ...creative, link },
+          adsetId,
+          pixelId,
+        });
+
+      let adId: string;
+      try {
+        adId = await writeOne();
+      } catch (err) {
+        // Retry ONCE on a rate limit, if the budget still has room for backoff + a
+        // creative/ad pair. (If the creative was made but the ad call was throttled,
+        // the retry makes a fresh creative; the unattached one is inert and harmless.)
+        const budgetLeft = BUDGET_MS - (Date.now() - startedAt);
+        if (!isRateLimitError(err) || budgetLeft < RETRY_BACKOFF_MS + 10_000) throw err;
+        await sleep(RETRY_BACKOFF_MS);
+        adId = await writeOne();
+      }
       results.push({ campaignId, storeCode, campaignName, ok: true, adId, pageId });
     } catch (err) {
+      if (isRateLimitError(err)) {
+        // Still throttled after the retry (or no budget to retry): suspend the run.
+        // This store gets no result row, so it lands in `remaining` for the resume.
+        rateLimited = true;
+        retryAfterMinutes = err.retryAfterMinutes;
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[create] ${account.slug} rate limited at campaign ${campaignId}; suspending run ` +
+            `(retryAfter=${retryAfterMinutes ?? "?"}min)`,
+        );
+        break;
+      }
       const msg =
         err instanceof MetaApiError
           ? metaErrorToMessage(err)
@@ -321,12 +557,15 @@ export async function POST(
 
   const created = results.filter((r) => r.ok).length;
   const processed = new Set(results.map((r) => r.campaignId));
+  const stopped = timedOut || rateLimited;
   return NextResponse.json({
     count: results.length,
     created,
     failed: results.length - created,
     results,
     timedOut,
-    remaining: timedOut ? wanted.filter((id) => !processed.has(id)) : [],
+    rateLimited,
+    retryAfterMinutes,
+    remaining: stopped ? wanted.filter((id) => !processed.has(id)) : [],
   });
 }

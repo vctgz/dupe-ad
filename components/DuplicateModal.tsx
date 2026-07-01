@@ -15,6 +15,7 @@
 // Presentational/self-contained: it owns its own form + preview state; the parent
 // supplies the selection context and an onClose. Clean light theme.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { upload } from "@vercel/blob/client";
 import {
   X,
   ImageUp,
@@ -26,6 +27,9 @@ import {
   Copy,
   Plus,
   Sparkles,
+  Film,
+  ChevronUp,
+  ChevronDown,
 } from "lucide-react";
 import type {
   DuplicateMode,
@@ -106,6 +110,57 @@ interface ImageState {
   matchedName: string | null;
 }
 
+/** What the ad displays. Mirrors the create route's `format` field. */
+type AdFormat = "single" | "video" | "carousel";
+
+const FORMAT_OPTIONS: { value: AdFormat; label: string }[] = [
+  { value: "single", label: "Static image" },
+  { value: "video", label: "Video" },
+  { value: "carousel", label: "Carousel" },
+];
+
+// Meta's child_attachments bounds.
+const MIN_CARDS = 2;
+const MAX_CARDS = 10;
+
+/** One carousel card being composed: a square image + its own copy/link. */
+interface CardState {
+  id: number;
+  image: ImageState | null;
+  headline: string;
+  description: string;
+  link: string;
+}
+
+function emptyCard(id: number): CardState {
+  return { id, image: null, headline: "", description: "", link: "" };
+}
+
+// Client-side ceiling for video picks; must stay <= the server's Blob token cap.
+const MAX_VIDEO_MB = 512;
+
+/**
+ * One picked video and where it is in the pipeline:
+ *   uploading   — browser -> Vercel Blob (direct; too big for a JSON API route)
+ *   registering — Blob URL -> Meta act_<id>/advideos (Meta downloads it itself)
+ *   processing  — Meta transcoding, polled via /api/video until ready
+ *   ready       — usable in creatives (videoId is account-scoped, reused per store)
+ */
+interface VideoState {
+  file: File;
+  fileName: string;
+  url: string; // object URL for the <video> preview
+  sizeMB: number;
+  duration: number | null;
+  phase: "uploading" | "registering" | "processing" | "ready" | "error";
+  uploadPct: number;
+  processingPct: number | null;
+  videoId: string | null;
+  error: string | null;
+}
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
 /** Closest target ratio + whether the image is within tolerance of any of them. */
 function validateRatio(
   ratio: number,
@@ -120,7 +175,7 @@ function validateRatio(
   return { ok: best.diff <= ASPECT_TOLERANCE, matchedName: best.name };
 }
 
-/** Read a File as a base64 data URL (for the Generate Copy request). */
+/** Read a File as a base64 data URL. */
 function readAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -128,6 +183,53 @@ function readAsDataUrl(file: File): Promise<string> {
     reader.onerror = () => reject(reader.error ?? new Error("Could not read image"));
     reader.readAsDataURL(file);
   });
+}
+
+// Longest-side cap for uploaded ad images. Meta re-compresses creatives anyway;
+// shipping an 8MP phone photo as base64 JSON just slows the request down and risks
+// serverless body limits.
+const MAX_IMAGE_DIM = 2048;
+
+// Encode each picked File exactly ONCE per session (keyed weakly so cleared images
+// free their memory). Generate Copy + every create/resume chunk reuse the result.
+const encodedImageCache = new WeakMap<File, Promise<string>>();
+
+/**
+ * File -> base64 data URL, downscaled to MAX_IMAGE_DIM on the longest side when
+ * needed. PNGs stay PNG (alpha survives); everything else re-encodes as JPEG.
+ * Falls back to the raw encoding if canvas work fails.
+ */
+function encodeImageFile(file: File): Promise<string> {
+  const hit = encodedImageCache.get(file);
+  if (hit) return hit;
+  const job = (async () => {
+    const raw = await readAsDataUrl(file);
+    try {
+      const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+        const el = new Image();
+        el.onload = () => resolve(el);
+        el.onerror = () => reject(new Error("Could not decode image"));
+        el.src = raw;
+      });
+      const w = img.naturalWidth;
+      const h = img.naturalHeight;
+      const scale = MAX_IMAGE_DIM / Math.max(w, h);
+      if (!Number.isFinite(scale) || scale >= 1) return raw;
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.round(w * scale);
+      canvas.height = Math.round(h * scale);
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return raw;
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      return file.type === "image/png"
+        ? canvas.toDataURL("image/png")
+        : canvas.toDataURL("image/jpeg", 0.92);
+    } catch {
+      return raw;
+    }
+  })();
+  encodedImageCache.set(file, job);
+  return job;
 }
 
 function Dropzone({
@@ -243,6 +345,130 @@ function Dropzone({
         )
       ) : (
         <span className="text-fas-11 text-ink-muted">No image yet</span>
+      )}
+    </div>
+  );
+}
+
+/** Human status line for a picked video's pipeline phase. */
+function videoStatusLine(v: VideoState): { text: string; tone: "ok" | "busy" | "bad" } {
+  switch (v.phase) {
+    case "uploading":
+      return { text: `Uploading… ${Math.round(v.uploadPct)}%`, tone: "busy" };
+    case "registering":
+      return { text: "Handing to Meta…", tone: "busy" };
+    case "processing":
+      return {
+        text: `Meta is processing${v.processingPct != null ? ` ${Math.round(v.processingPct)}%` : ""}…`,
+        tone: "busy",
+      };
+    case "ready":
+      return { text: `Ready · ${v.sizeMB.toFixed(1)}MB`, tone: "ok" };
+    case "error":
+      return { text: v.error ?? "Upload failed", tone: "bad" };
+  }
+}
+
+function VideoDropzone({
+  video,
+  onPick,
+  onClear,
+}: {
+  video: VideoState | null;
+  onPick: (file: File) => void;
+  onClear: () => void;
+}) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [dragOver, setDragOver] = useState(false);
+
+  const handleFiles = (files: FileList | null) => {
+    const file = files?.[0];
+    if (file && file.type.startsWith("video/")) onPick(file);
+  };
+
+  const status = video ? videoStatusLine(video) : null;
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="flex items-baseline justify-between gap-2">
+        <span className="whitespace-nowrap text-fas-12 font-medium text-ink">Video</span>
+        <span className="min-w-0 truncate font-mono text-fas-11 text-ink-muted">
+          MP4 / MOV · up to {MAX_VIDEO_MB}MB
+        </span>
+      </div>
+      <div
+        onDragOver={(e) => {
+          e.preventDefault();
+          setDragOver(true);
+        }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setDragOver(false);
+          handleFiles(e.dataTransfer.files);
+        }}
+        className={[
+          "relative flex aspect-video w-full items-center justify-center overflow-hidden rounded-fas-md border border-dashed transition-colors",
+          dragOver
+            ? "border-accent bg-accent-tint"
+            : "border-hairline-strong bg-surface-sunken hover:border-accent/60 hover:bg-accent-tint/40",
+        ].join(" ")}
+      >
+        {video ? (
+          <>
+            {/* eslint-disable-next-line jsx-a11y/media-has-caption -- operator's own upload preview */}
+            <video src={video.url} controls muted playsInline className="h-full w-full object-contain" />
+            <button
+              type="button"
+              onClick={onClear}
+              aria-label="Remove video"
+              className="fas-focus absolute right-1.5 top-1.5 inline-flex h-6 w-6 items-center justify-center rounded-fas-sm bg-surface/90 text-ink-muted shadow-fas-card hover:text-ink"
+            >
+              <Trash2 size={13} strokeWidth={2} aria-hidden="true" />
+            </button>
+          </>
+        ) : (
+          <button
+            type="button"
+            onClick={() => inputRef.current?.click()}
+            className="fas-focus flex h-full w-full flex-col items-center justify-center gap-1.5 px-2 text-center text-ink-muted hover:text-ink"
+          >
+            <Film size={20} strokeWidth={1.75} aria-hidden="true" />
+            <span className="text-fas-11">Drop or choose a video</span>
+          </button>
+        )}
+        <input
+          ref={inputRef}
+          type="file"
+          accept="video/*"
+          className="sr-only"
+          onChange={(e) => handleFiles(e.target.files)}
+          aria-label="Ad video"
+        />
+      </div>
+      {status ? (
+        <span
+          className={[
+            "inline-flex items-center gap-1 text-fas-11",
+            status.tone === "ok"
+              ? "text-status-ok"
+              : status.tone === "bad"
+                ? "text-status-mismatch"
+                : "text-ink-muted",
+          ].join(" ")}
+          role={status.tone === "bad" ? "alert" : undefined}
+        >
+          {status.tone === "ok" ? (
+            <CheckCircle2 size={12} strokeWidth={2} aria-hidden="true" />
+          ) : status.tone === "bad" ? (
+            <TriangleAlert size={12} strokeWidth={2} aria-hidden="true" />
+          ) : (
+            <RotateCw size={12} strokeWidth={2} aria-hidden="true" className="animate-spin" />
+          )}
+          {status.text}
+        </span>
+      ) : (
+        <span className="text-fas-11 text-ink-muted">No video yet</span>
       )}
     </div>
   );
@@ -379,8 +605,62 @@ function PlanView({ plan }: { plan: DuplicatePreviewResponse }) {
   );
 }
 
+/**
+ * Live countdown from Meta's regain estimate. Purely informational — the resume
+ * button stays enabled throughout (the estimate is often pessimistic).
+ */
+function RetryCountdown({ minutes }: { minutes: number }) {
+  const [left, setLeft] = useState(minutes * 60);
+  useEffect(() => {
+    setLeft(minutes * 60);
+    const t = setInterval(() => setLeft((s) => Math.max(0, s - 1)), 1000);
+    return () => clearInterval(t);
+  }, [minutes]);
+  if (left <= 0) return <>Meta&apos;s estimate has elapsed — resuming should work now.</>;
+  const mm = Math.floor(left / 60);
+  const ss = String(left % 60).padStart(2, "0");
+  return (
+    <>
+      Meta estimates <span className="font-mono tabular-nums">{mm}:{ss}</span> until the limit
+      lifts.
+    </>
+  );
+}
+
+/**
+ * Merge a resume run's results onto the previous partial run: later rows win per
+ * campaign, the stop flags (timedOut/rateLimited/remaining) come from the latest run.
+ */
+export function mergeCreateResults(
+  prev: CreateAdsResponse,
+  next: CreateAdsResponse,
+): CreateAdsResponse {
+  const redone = new Set(next.results.map((r) => r.campaignId));
+  const results = [...prev.results.filter((r) => !redone.has(r.campaignId)), ...next.results];
+  const created = results.filter((r) => r.ok).length;
+  return {
+    ...next,
+    count: results.length,
+    created,
+    failed: results.length - created,
+    results,
+  };
+}
+
 /** Per-store results of a live create — never a blanket "all succeeded". */
-function CreateResultView({ result }: { result: CreateAdsResponse }) {
+function CreateResultView({
+  result,
+  creating,
+  onResume,
+}: {
+  result: CreateAdsResponse;
+  /** True while a (re)run is in flight — disables the resume button. */
+  creating: boolean;
+  /** Re-run just the remaining campaign ids. */
+  onResume: () => void;
+}) {
+  const remaining = result.remaining ?? [];
+  const stopped = (result.rateLimited || result.timedOut) && remaining.length > 0;
   return (
     <div className="flex flex-col gap-3 rounded-fas-md border border-hairline bg-surface-sunken p-3">
       <div className="flex flex-wrap items-center gap-2 text-fas-12">
@@ -397,11 +677,42 @@ function CreateResultView({ result }: { result: CreateAdsResponse }) {
         ) : null}
       </div>
 
-      {result.timedOut ? (
-        <p className="text-fas-12 text-status-mismatch">
-          Stopped at the time limit before finishing. {result.remaining?.length ?? 0} store
-          {(result.remaining?.length ?? 0) === 1 ? "" : "s"} not attempted — re-run to finish the rest.
-        </p>
+      {stopped ? (
+        <div
+          className="flex flex-col gap-2 rounded-fas-md border border-status-mismatch-border bg-status-mismatch-bg px-3 py-2.5"
+          role="alert"
+        >
+          <p className="text-fas-12 font-semibold text-status-mismatch">
+            {result.rateLimited
+              ? `Meta's rate limit paused this run — ${remaining.length} store${remaining.length === 1 ? "" : "s"} still to do.`
+              : `Stopped at the time limit — ${remaining.length} store${remaining.length === 1 ? "" : "s"} not attempted yet.`}
+          </p>
+          {result.rateLimited ? (
+            <p className="text-fas-12 text-status-mismatch">
+              {result.retryAfterMinutes && result.retryAfterMinutes > 0 ? (
+                <RetryCountdown minutes={result.retryAfterMinutes} />
+              ) : (
+                "Give it a minute, then resume."
+              )}
+            </p>
+          ) : null}
+          <div>
+            <button
+              type="button"
+              onClick={onResume}
+              disabled={creating}
+              className="fas-focus inline-flex items-center gap-2 rounded-fas-md border border-status-mismatch-border bg-surface px-3.5 py-1.5 text-fas-12 font-semibold text-status-mismatch transition-colors hover:brightness-105 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <RotateCw
+                size={13}
+                strokeWidth={2}
+                aria-hidden="true"
+                className={creating ? "animate-spin" : ""}
+              />
+              {creating ? "Resuming…" : `Resume (${remaining.length} remaining)`}
+            </button>
+          </div>
+        </div>
       ) : null}
 
       <ul className="flex max-h-56 flex-col divide-y divide-hairline overflow-y-auto">
@@ -487,6 +798,15 @@ export default function DuplicateModal({
 
   const [images, setImages] = useState<Partial<Record<Placement["key"], ImageState>>>({});
 
+  // Ad format (create mode): static image vs video vs carousel.
+  const [format, setFormat] = useState<AdFormat>("single");
+  const [video, setVideo] = useState<VideoState | null>(null);
+  // Generation counter so a cleared/replaced video cancels its in-flight pipeline.
+  const videoGenRef = useRef(0);
+  // Carousel cards, in display order.
+  const [cards, setCards] = useState<CardState[]>([emptyCard(1), emptyCard(2)]);
+  const nextCardId = useRef(3);
+
   const [previewing, setPreviewing] = useState(false);
   const [plan, setPlan] = useState<DuplicatePreviewResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -499,6 +819,10 @@ export default function DuplicateModal({
   const [phase, setPhase] = useState<"idle" | "creating">("idle");
   const [createResult, setCreateResult] = useState<CreateAdsResponse | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
+  // Chunked-run progress ("Creating… 40/120"), null outside a run.
+  const [createProgress, setCreateProgress] = useState<{ done: number; total: number } | null>(
+    null,
+  );
 
   const dialogRef = useRef<HTMLDivElement>(null);
 
@@ -509,17 +833,26 @@ export default function DuplicateModal({
   const hasImage = imageList.length > 0;
 
   // Submit gating. Duplicate needs only the ad name (creative is inherited).
-  // Create requires EVERY field — name, URL, all copy, a CTA, and an image.
+  // Create requires EVERY field — name, URL, all copy, a CTA, and the media for the
+  // chosen format: an image (static) or a PROCESSED video + square thumbnail (video).
   const linkOk = isValidUrl(link);
   const adNameOk = adName.trim().length > 0;
-  const createReady =
-    adNameOk &&
-    linkOk &&
+  const isVideo = isCreate && format === "video";
+  const isCarousel = isCreate && format === "carousel";
+  const videoReady = video?.phase === "ready" && !!video.videoId;
+  const hasThumb = !!images.square;
+  // Every card needs its square image + a headline; the shared headline/subheadline
+  // fields don't apply (each card carries its own).
+  const cardsReady =
+    cards.length >= MIN_CARDS && cards.every((c) => c.image && c.headline.trim().length > 0);
+  // Video creatives carry the destination link ONLY in the CTA, so "No Button" is
+  // not a valid choice for them.
+  const ctaOk = isVideo ? cta.length > 0 && cta !== "NO_BUTTON" : cta.length > 0;
+  const mediaOk = isVideo ? videoReady && hasThumb : isCarousel ? cardsReady : hasImage;
+  const copyOk =
     primaryText.trim().length > 0 &&
-    headline.trim().length > 0 &&
-    subheadline.trim().length > 0 &&
-    cta.length > 0 &&
-    hasImage;
+    (isCarousel || (headline.trim().length > 0 && subheadline.trim().length > 0));
+  const createReady = adNameOk && linkOk && copyOk && ctaOk && mediaOk;
   const canPreview = n > 0 && !previewing && (isCreate ? createReady : adNameOk);
   // Live create is gated on: create mode, real write creds, a complete form, and
   // not already busy. Duplicate-mode live cloning is a deliberate follow-up.
@@ -606,12 +939,239 @@ export default function DuplicateModal({
     });
   }, []);
 
+  const clearVideo = useCallback(() => {
+    videoGenRef.current += 1; // cancels any in-flight upload/poll chain
+    setVideo((prev) => {
+      if (prev) URL.revokeObjectURL(prev.url);
+      return null;
+    });
+  }, []);
+
+  // ── Carousel card handlers ──────────────────────────────────────────────────
+  const addCard = useCallback(() => {
+    setCards((prev) =>
+      prev.length >= MAX_CARDS ? prev : [...prev, emptyCard(nextCardId.current++)],
+    );
+  }, []);
+
+  const removeCard = useCallback((id: number) => {
+    setCards((prev) => {
+      if (prev.length <= MIN_CARDS) return prev;
+      const gone = prev.find((c) => c.id === id);
+      if (gone?.image) URL.revokeObjectURL(gone.image.url);
+      return prev.filter((c) => c.id !== id);
+    });
+  }, []);
+
+  const moveCard = useCallback((id: number, dir: -1 | 1) => {
+    setCards((prev) => {
+      const i = prev.findIndex((c) => c.id === id);
+      const j = i + dir;
+      if (i < 0 || j < 0 || j >= prev.length) return prev;
+      const next = [...prev];
+      [next[i], next[j]] = [next[j]!, next[i]!];
+      return next;
+    });
+  }, []);
+
+  const setCardField = useCallback(
+    (id: number, field: "headline" | "description" | "link", value: string) => {
+      setCards((prev) => prev.map((c) => (c.id === id ? { ...c, [field]: value } : c)));
+    },
+    [],
+  );
+
+  const pickCardImage = useCallback((id: number, file: File) => {
+    const url = URL.createObjectURL(file);
+    const probe = new Image();
+    probe.onload = () => {
+      const { width, height } = probe;
+      const ratio = width / height;
+      const { ok, matchedName } = validateRatio(ratio, PLACEMENTS[0]!.ratios);
+      setCards((prev) =>
+        prev.map((c) => {
+          if (c.id !== id) return c;
+          if (c.image) URL.revokeObjectURL(c.image.url);
+          return {
+            ...c,
+            image: { url, file, fileName: file.name, width, height, ratio, ok, matchedName },
+          };
+        }),
+      );
+    };
+    probe.onerror = () => URL.revokeObjectURL(url);
+    probe.src = url;
+  }, []);
+
+  const clearCardImage = useCallback((id: number) => {
+    setCards((prev) =>
+      prev.map((c) => {
+        if (c.id !== id || !c.image) return c;
+        URL.revokeObjectURL(c.image.url);
+        return { ...c, image: null };
+      }),
+    );
+  }, []);
+
+  // Revoke card image object URLs on unmount (same pattern as the placements).
+  const cardsRef = useRef(cards);
+  cardsRef.current = cards;
+  useEffect(() => {
+    return () => {
+      cardsRef.current.forEach((c) => {
+        if (c.image) URL.revokeObjectURL(c.image.url);
+      });
+    };
+  }, []);
+
+  // Revoke the video object URL + cancel polling on unmount.
+  useEffect(() => {
+    return () => {
+      videoGenRef.current += 1;
+      setVideo((prev) => {
+        if (prev) URL.revokeObjectURL(prev.url);
+        return null;
+      });
+    };
+  }, []);
+
+  /**
+   * The full video pipeline, kicked off at pick time so the operator fills in copy
+   * while Meta processes: browser -> Blob (direct client upload), Blob URL ->
+   * /api/video (Meta pulls it), then poll /api/video until ready. A bumped
+   * generation (clear/replace/close) abandons the chain at the next checkpoint.
+   */
+  const pickVideo = useCallback(
+    (file: File) => {
+      videoGenRef.current += 1;
+      const gen = videoGenRef.current;
+      const url = URL.createObjectURL(file);
+      const sizeMB = file.size / (1024 * 1024);
+
+      setVideo((prev) => {
+        if (prev) URL.revokeObjectURL(prev.url);
+        return {
+          file,
+          fileName: file.name,
+          url,
+          sizeMB,
+          duration: null,
+          phase: "uploading",
+          uploadPct: 0,
+          processingPct: null,
+          videoId: null,
+          error: null,
+        };
+      });
+
+      if (sizeMB > MAX_VIDEO_MB) {
+        setVideo((v) =>
+          v && videoGenRef.current === gen
+            ? { ...v, phase: "error", error: `Video is ${sizeMB.toFixed(0)}MB — the limit is ${MAX_VIDEO_MB}MB.` }
+            : v,
+        );
+        return;
+      }
+
+      // Duration probe (informational only).
+      const probe = document.createElement("video");
+      probe.preload = "metadata";
+      probe.onloadedmetadata = () => {
+        if (videoGenRef.current === gen) {
+          setVideo((v) => (v ? { ...v, duration: probe.duration } : v));
+        }
+      };
+      probe.src = url;
+
+      void (async () => {
+        try {
+          const blob = await upload(`ad-videos/${file.name}`, file, {
+            access: "public",
+            handleUploadUrl: "/api/blob-upload",
+            clientPayload: JSON.stringify({ accountSlug }),
+            onUploadProgress: ({ percentage }) => {
+              if (videoGenRef.current === gen) {
+                setVideo((v) => (v ? { ...v, uploadPct: percentage } : v));
+              }
+            },
+          });
+          if (videoGenRef.current !== gen) return;
+          setVideo((v) => (v ? { ...v, phase: "registering" } : v));
+
+          const res = await fetch("/api/video", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ accountSlug, url: blob.url, name: file.name }),
+          });
+          const body = (await res.json().catch(() => ({}))) as {
+            videoId?: string;
+            error?: string;
+          };
+          if (!res.ok || !body.videoId) {
+            throw new Error(body.error ?? `Video registration failed (HTTP ${res.status})`);
+          }
+          if (videoGenRef.current !== gen) return;
+          const videoId = body.videoId;
+          setVideo((v) => (v ? { ...v, phase: "processing", videoId } : v));
+
+          for (;;) {
+            await sleep(3_000);
+            if (videoGenRef.current !== gen) return;
+            const sres = await fetch(
+              `/api/video?account=${encodeURIComponent(accountSlug)}&videoId=${encodeURIComponent(videoId)}`,
+            );
+            const sbody = (await sres.json().catch(() => ({}))) as {
+              status?: string;
+              progress?: number | null;
+              error?: string;
+            };
+            if (!sres.ok) throw new Error(sbody.error ?? "Video status check failed");
+            if (videoGenRef.current !== gen) return;
+            if (sbody.status === "ready") {
+              setVideo((v) => (v ? { ...v, phase: "ready", processingPct: 100 } : v));
+              return;
+            }
+            if (sbody.status === "error") {
+              throw new Error("Meta could not process this video — try a different file.");
+            }
+            setVideo((v) =>
+              v ? { ...v, processingPct: sbody.progress ?? v.processingPct } : v,
+            );
+          }
+        } catch (err) {
+          if (videoGenRef.current !== gen) return;
+          setVideo((v) =>
+            v
+              ? {
+                  ...v,
+                  phase: "error",
+                  error: err instanceof Error ? err.message : "Video upload failed",
+                }
+              : v,
+          );
+        }
+      })();
+    },
+    [accountSlug],
+  );
+
+  // Generate Copy reads whatever media the current format shows: card images for a
+  // carousel, the placement images otherwise.
+  const hasGenSource = isCarousel ? cards.some((c) => c.image) : hasImage;
+
   async function generateCopy() {
-    if (!hasImage || generating) return;
+    // The generate-copy API accepts at most 3 images; a carousel can have 10 cards,
+    // so send the first three — plenty of signal for the model.
+    const files = (
+      isCarousel
+        ? cards.map((c) => c.image?.file).filter((f): f is File => !!f)
+        : imageList.map((i) => i.file)
+    ).slice(0, 3);
+    if (files.length === 0 || generating) return;
     setGenerating(true);
     setGenError(null);
     try {
-      const dataUrls = await Promise.all(imageList.map((img) => readAsDataUrl(img.file)));
+      const dataUrls = await Promise.all(files.map((f) => encodeImageFile(f)));
       const res = await fetch("/api/generate-copy", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -677,51 +1237,97 @@ export default function DuplicateModal({
     }
   }
 
+  // How many stores each POST /api/create carries. Small chunks keep every request
+  // far from the server's 50s budget, surface per-store results as they land, and
+  // dovetail with the rateLimited/timedOut resume contract.
+  const CREATE_CHUNK = 20;
+
   // LIVE WRITE — create the paused ads for real. Triggered by the primary button, only in
-  // create mode with write creds (canCreate gates it). Sends the uploaded image(s) so the
-  // server can register the account-scoped image_hash and build a per-store creative.
-  async function doCreate() {
+  // create mode with write creds (canCreate gates it). Media is encoded ONCE (memoized,
+  // downscaled) and the campaign ids run in chunks of CREATE_CHUNK, merging per-store
+  // results into the panel as each chunk lands. With `idsOverride` (the resume path) it
+  // re-runs ONLY those ids and merges onto the previous partial result. A rateLimited or
+  // timedOut chunk stops the run; untried ids join `remaining` so resume covers them.
+  async function doCreate(idsOverride?: string[]) {
+    const ids = idsOverride ?? campaignIds;
+    if (ids.length === 0) return;
     setPhase("creating");
     setCreateError(null);
-    setCreateResult(null);
+    if (!idsOverride) setCreateResult(null);
+    setCreateProgress({ done: 0, total: ids.length });
     try {
       const entries = Object.entries(images).filter(
         (e): e is [Placement["key"], ImageState] => !!e[1],
       );
+      // Video mode sends ONLY the square slot (it rides along as the thumbnail);
+      // carousel sends no placement images at all (each card carries its own).
+      const sendEntries = isCarousel ? [] : isVideo ? entries.filter(([k]) => k === "square") : entries;
       const imgs = await Promise.all(
-        entries.map(async ([placement, st]) => ({
+        sendEntries.map(async ([placement, st]) => ({
           placement,
-          dataUrl: await readAsDataUrl(st.file),
+          dataUrl: await encodeImageFile(st.file),
         })),
       );
-      const res = await fetch("/api/create", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          accountSlug,
-          mode,
-          adName: adName.trim(),
-          adsetName: adsetName.trim() || undefined,
-          campaignIds,
-          creative: {
-            primaryText,
-            headline,
-            subheadline,
-            link: link.trim(),
-            cta: cta || undefined,
-          },
-          images: imgs,
-        }),
-      });
-      const body = (await res.json().catch(() => ({}))) as CreateAdsResponse & { error?: string };
-      if (!res.ok) {
-        throw new Error(body.error ?? `Create failed (HTTP ${res.status})`);
+      const cardPayload = isCarousel
+        ? await Promise.all(
+            cards.map(async (c) => ({
+              dataUrl: await encodeImageFile(c.image!.file),
+              headline: c.headline.trim(),
+              description: c.description.trim() || undefined,
+              link: c.link.trim() || undefined,
+            })),
+          )
+        : undefined;
+      const payloadBase = {
+        accountSlug,
+        mode,
+        format: isVideo ? "video" : isCarousel ? "carousel" : "single",
+        videoId: isVideo ? video?.videoId ?? undefined : undefined,
+        cards: cardPayload,
+        adName: adName.trim(),
+        adsetName: adsetName.trim() || undefined,
+        creative: {
+          primaryText,
+          headline,
+          subheadline,
+          link: link.trim(),
+          cta: cta || undefined,
+        },
+        images: imgs,
+      };
+
+      let merged: CreateAdsResponse | null = idsOverride ? createResult : null;
+      for (let i = 0; i < ids.length; i += CREATE_CHUNK) {
+        const chunk = ids.slice(i, i + CREATE_CHUNK);
+        const res = await fetch("/api/create", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...payloadBase, campaignIds: chunk }),
+        });
+        const body = (await res.json().catch(() => ({}))) as CreateAdsResponse & {
+          error?: string;
+        };
+        if (!res.ok) {
+          throw new Error(body.error ?? `Create failed (HTTP ${res.status})`);
+        }
+        merged = merged ? mergeCreateResults(merged, body) : body;
+        const stopped = body.rateLimited || body.timedOut;
+        if (stopped) {
+          // Untried chunks join the suspended chunk's leftovers for the resume.
+          merged = {
+            ...merged,
+            remaining: [...(body.remaining ?? []), ...ids.slice(i + CREATE_CHUNK)],
+          };
+        }
+        setCreateResult(merged);
+        setCreateProgress({ done: Math.min(i + chunk.length, ids.length), total: ids.length });
+        if (stopped) break;
       }
-      setCreateResult(body);
     } catch (err) {
       setCreateError(err instanceof Error ? err.message : "Create failed");
     } finally {
       setPhase("idle");
+      setCreateProgress(null);
     }
   }
 
@@ -815,34 +1421,187 @@ export default function DuplicateModal({
             />
           </Field>
 
-          {/* Images — first, so copy can be generated from them. */}
+          {/* Format — create mode only. Video is gated on write creds because the
+              upload registers against the ad account immediately. */}
+          {isCreate ? (
+            <div className="flex flex-col gap-2">
+              <span className="text-fas-11 font-semibold uppercase tracking-caps text-ink-faint">
+                Format
+              </span>
+              <div
+                className="inline-flex gap-1 self-start rounded-fas-md border border-hairline bg-surface-sunken p-1"
+                role="radiogroup"
+                aria-label="Ad format"
+              >
+                {FORMAT_OPTIONS.map((o) => {
+                  const disabled = o.value === "video" && !writeEnabled;
+                  const active = format === o.value;
+                  return (
+                    <button
+                      key={o.value}
+                      type="button"
+                      role="radio"
+                      aria-checked={active}
+                      disabled={disabled}
+                      title={
+                        disabled
+                          ? "Add a Meta write token (META_SYSTEM_USER_TOKEN) to upload videos."
+                          : undefined
+                      }
+                      onClick={() => {
+                        setFormat(o.value);
+                        // Video can't use "No Button" (the CTA carries the link);
+                        // clear a stale pick so the select doesn't sit on a value
+                        // that's no longer offered.
+                        if (o.value === "video" && cta === "NO_BUTTON") setCta("");
+                      }}
+                      className={[
+                        "fas-focus rounded-fas-sm px-3 py-1.5 text-fas-12 font-semibold transition-colors",
+                        active
+                          ? "bg-surface text-ink shadow-fas-card"
+                          : disabled
+                            ? "cursor-not-allowed text-ink-faint opacity-60"
+                            : "text-ink-muted hover:text-ink",
+                      ].join(" ")}
+                    >
+                      {o.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ) : null}
+
+          {/* Media — first, so copy can be generated from it. */}
           <div className="flex flex-col gap-3">
             <span className="text-fas-11 font-semibold uppercase tracking-caps text-ink-faint">
-              Images
+              {isVideo ? "Video + thumbnail" : isCarousel ? "Cards" : "Images"}
               {isCreate ? <span className="ml-0.5 text-accent" aria-hidden="true">*</span> : null}
             </span>
-            <div className="grid grid-cols-1 items-start gap-4 sm:grid-cols-3">
-              {PLACEMENTS.map((p) => (
+            {isVideo ? (
+              <div className="grid grid-cols-1 items-start gap-4 sm:grid-cols-3">
+                <div className="sm:col-span-2">
+                  <VideoDropzone video={video} onPick={pickVideo} onClear={clearVideo} />
+                </div>
                 <Dropzone
-                  key={p.key}
-                  placement={p}
-                  image={images[p.key]}
-                  onPick={(file) => pickImage(p, file)}
-                  onClear={() => clearImage(p.key)}
+                  placement={{ ...PLACEMENTS[0]!, label: "Thumbnail 1:1" }}
+                  image={images.square}
+                  onPick={(file) => pickImage(PLACEMENTS[0]!, file)}
+                  onClear={() => clearImage("square")}
                 />
-              ))}
-            </div>
+              </div>
+            ) : isCarousel ? (
+              <div className="flex flex-col gap-3">
+                {cards.map((card, i) => (
+                  <div
+                    key={card.id}
+                    className="flex flex-col gap-3 rounded-fas-md border border-hairline bg-surface-sunken p-3 sm:flex-row sm:items-start"
+                  >
+                    <div className="w-full shrink-0 sm:w-44">
+                      <Dropzone
+                        placement={{ ...PLACEMENTS[0]!, label: `Card ${i + 1}` }}
+                        image={card.image ?? undefined}
+                        onPick={(file) => pickCardImage(card.id, file)}
+                        onClear={() => clearCardImage(card.id)}
+                      />
+                    </div>
+                    <div className="flex min-w-0 flex-1 flex-col gap-2">
+                      <input
+                        type="text"
+                        value={card.headline}
+                        onChange={(e) => setCardField(card.id, "headline", e.target.value)}
+                        placeholder="Card headline *"
+                        aria-label={`Card ${i + 1} headline`}
+                        className="fas-focus w-full rounded-fas-md border border-hairline bg-surface px-3 py-2 text-fas-13 text-ink placeholder:text-ink-muted"
+                      />
+                      <input
+                        type="text"
+                        value={card.description}
+                        onChange={(e) => setCardField(card.id, "description", e.target.value)}
+                        placeholder="Description (optional)"
+                        aria-label={`Card ${i + 1} description`}
+                        className="fas-focus w-full rounded-fas-md border border-hairline bg-surface px-3 py-2 text-fas-13 text-ink placeholder:text-ink-muted"
+                      />
+                      <input
+                        type="url"
+                        value={card.link}
+                        onChange={(e) => setCardField(card.id, "link", e.target.value)}
+                        placeholder="Link (optional — defaults to the Destination URL)"
+                        aria-label={`Card ${i + 1} link`}
+                        className="fas-focus w-full rounded-fas-md border border-hairline bg-surface px-3 py-2 text-fas-13 text-ink placeholder:text-ink-muted"
+                      />
+                    </div>
+                    <div className="flex shrink-0 gap-1 sm:flex-col">
+                      <button
+                        type="button"
+                        onClick={() => moveCard(card.id, -1)}
+                        disabled={i === 0}
+                        aria-label={`Move card ${i + 1} up`}
+                        className="fas-focus inline-flex h-7 w-7 items-center justify-center rounded-fas-sm border border-hairline bg-surface text-ink-muted hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        <ChevronUp size={14} strokeWidth={2} aria-hidden="true" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => moveCard(card.id, 1)}
+                        disabled={i === cards.length - 1}
+                        aria-label={`Move card ${i + 1} down`}
+                        className="fas-focus inline-flex h-7 w-7 items-center justify-center rounded-fas-sm border border-hairline bg-surface text-ink-muted hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        <ChevronDown size={14} strokeWidth={2} aria-hidden="true" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => removeCard(card.id)}
+                        disabled={cards.length <= MIN_CARDS}
+                        aria-label={`Remove card ${i + 1}`}
+                        className="fas-focus inline-flex h-7 w-7 items-center justify-center rounded-fas-sm border border-hairline bg-surface text-ink-muted hover:text-status-mismatch disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        <Trash2 size={14} strokeWidth={2} aria-hidden="true" />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    onClick={addCard}
+                    disabled={cards.length >= MAX_CARDS}
+                    className="fas-focus inline-flex items-center gap-2 rounded-fas-md border border-hairline bg-surface px-3.5 py-2 text-fas-13 font-semibold text-ink transition-colors hover:border-hairline-strong disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <Plus size={14} strokeWidth={2} aria-hidden="true" />
+                    Add card ({cards.length}/{MAX_CARDS})
+                  </button>
+                  <span className="text-fas-11 text-ink-muted">
+                    Cards without a link use the Destination URL (or the store&apos;s mapped
+                    landing page).
+                  </span>
+                </div>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 items-start gap-4 sm:grid-cols-3">
+                {PLACEMENTS.map((p) => (
+                  <Dropzone
+                    key={p.key}
+                    placement={p}
+                    image={images[p.key]}
+                    onPick={(file) => pickImage(p, file)}
+                    onClear={() => clearImage(p.key)}
+                  />
+                ))}
+              </div>
+            )}
 
             {/* ✨ Generate Copy — suppressed (dimmed) until an image is uploaded. */}
             <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
               <button
                 type="button"
                 onClick={generateCopy}
-                disabled={!hasImage || generating}
-                title={hasImage ? undefined : "Upload an image to generate copy"}
+                disabled={!hasGenSource || generating}
+                title={hasGenSource ? undefined : "Upload an image to generate copy"}
                 className={[
                   "fas-focus inline-flex items-center gap-2 rounded-fas-pill border px-3.5 py-1.5 text-fas-13 font-semibold transition-all duration-[110ms] ease-fas",
-                  hasImage && !generating
+                  hasGenSource && !generating
                     ? "border-accent/40 bg-accent-tint text-accent hover:border-accent hover:bg-accent-tint/80"
                     : "cursor-not-allowed border-hairline bg-surface-sunken text-ink-faint opacity-70",
                 ].join(" ")}
@@ -855,7 +1614,7 @@ export default function DuplicateModal({
                 {generating ? "Generating…" : "Generate Copy"}
               </button>
               <span className="text-fas-11 text-ink-muted">
-                {hasImage
+                {hasGenSource
                   ? "Powered by Anthropic — fills the copy fields from your image. Edit anything after."
                   : "Upload an image to generate copy with AI."}
               </span>
@@ -886,6 +1645,8 @@ export default function DuplicateModal({
             />
           </Field>
 
+          {/* Shared headline/subheadline don't apply to carousels — each card has its own. */}
+          {!isCarousel ? (
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <Field
               label="Headline"
@@ -918,6 +1679,7 @@ export default function DuplicateModal({
               />
             </Field>
           </div>
+          ) : null}
 
           {/* Destination + CTA. URL is required in create mode, optional in duplicate. */}
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
@@ -944,6 +1706,9 @@ export default function DuplicateModal({
             </Field>
             <Field
               label={isCreate ? "Call-to-action" : "Call-to-action (optional)"}
+              helper={
+                isVideo ? "Video ads require a button — it carries the destination link." : undefined
+              }
               htmlFor="dm-cta"
               required={isCreate}
             >
@@ -954,7 +1719,7 @@ export default function DuplicateModal({
                 className="fas-focus w-full rounded-fas-md border border-hairline bg-surface px-3.5 py-2.5 text-fas-14 text-ink"
               >
                 <option value="">{isCreate ? "Select…" : "— None —"}</option>
-                {CTA_OPTIONS.map((c) => (
+                {CTA_OPTIONS.filter((c) => !(isVideo && c.value === "NO_BUTTON")).map((c) => (
                   <option key={c.value} value={c.value}>
                     {c.label}
                   </option>
@@ -985,7 +1750,13 @@ export default function DuplicateModal({
               {createError}
             </p>
           ) : null}
-          {createResult ? <CreateResultView result={createResult} /> : null}
+          {createResult ? (
+            <CreateResultView
+              result={createResult}
+              creating={phase === "creating"}
+              onResume={() => void doCreate(createResult.remaining ?? [])}
+            />
+          ) : null}
         </div>
 
         {/* Footer actions — one explicit step. Every ad is PAUSED (reversible), so no
@@ -1024,7 +1795,7 @@ export default function DuplicateModal({
             {/* PRIMARY — the live write, one click. Gated on write creds + a complete form. */}
             <button
               type="button"
-              onClick={doCreate}
+              onClick={() => void doCreate()}
               disabled={!canCreate}
               title={
                 !isCreate
@@ -1032,7 +1803,13 @@ export default function DuplicateModal({
                   : !writeEnabled
                     ? "Add a Meta write token (META_SYSTEM_USER_TOKEN) to enable live creation."
                     : !createReady
-                      ? "Fill every required field (and add an image) first."
+                      ? isVideo
+                        ? video && video.phase !== "ready" && video.phase !== "error"
+                          ? "Wait for the video to finish processing."
+                          : "Fill every required field, plus a video and a square thumbnail."
+                        : isCarousel
+                          ? "Every card needs a square image and a headline (2 cards minimum)."
+                          : "Fill every required field (and add an image) first."
                       : undefined
               }
               className="fas-focus inline-flex items-center gap-2 rounded-fas-md bg-accent px-4 py-2 text-fas-13 font-semibold text-ink-on-accent transition-colors duration-[110ms] ease-fas hover:bg-accent-hover active:bg-accent-pressed disabled:cursor-not-allowed disabled:bg-surface-sunken disabled:text-ink-faint disabled:hover:bg-surface-sunken"
@@ -1042,7 +1819,11 @@ export default function DuplicateModal({
               ) : (
                 <Plus size={14} strokeWidth={2} aria-hidden="true" />
               )}
-              {phase === "creating" ? "Creating…" : `Create ${n} paused ad${n === 1 ? "" : "s"}`}
+              {phase === "creating"
+                ? createProgress && createProgress.total > CREATE_CHUNK
+                  ? `Creating… ${createProgress.done}/${createProgress.total}`
+                  : "Creating…"
+                : `Create ${n} paused ad${n === 1 ? "" : "s"}`}
             </button>
           </div>
         </div>

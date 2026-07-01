@@ -90,6 +90,7 @@ reads. The optional team login adds a few more (see [Team access](#team-access-o
 | `MAPPING_<SLUG>`          | no       | Store→Page mapping CSV for one account, supplied via env (e.g. `MAPPING_ACME`), for hosted deploys where `data/mapping/*.csv` isn't present. Value is the raw CSV text; wins over the file. |
 | `ANTHROPIC_API_KEY`       | no       | Powers the Generate Copy button. Without it, Generate Copy returns 503 and everything else works fine. |
 | `ANTHROPIC_COPY_MODEL`    | no       | Model used for Generate Copy. Defaults to `claude-sonnet-4-6`.                                |
+| `BLOB_READ_WRITE_TOKEN`   | no       | Vercel Blob token; powers Video ad uploads (browser → Blob → Meta `file_url`). Injected automatically when a Blob store is connected on Vercel. Without it, video uploads fail; static ads are unaffected. |
 
 A note on the token: its identity must have access to BOTH the ad account AND every
 Facebook Page you publish from. Otherwise page-bound ad creation fails. A normal User

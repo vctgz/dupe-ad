@@ -18,6 +18,9 @@ export class MetaApiError extends Error {
   readonly type: string | null;
   readonly httpStatus: number;
   readonly fbtraceId: string | null;
+  /** For rate-limit errors: Meta's estimate (minutes) until access returns, from the
+   *  usage headers on the failing response. null when unknown / not a rate limit. */
+  readonly retryAfterMinutes: number | null;
 
   constructor(args: {
     message: string;
@@ -26,6 +29,7 @@ export class MetaApiError extends Error {
     type: string | null;
     httpStatus: number;
     fbtraceId?: string | null;
+    retryAfterMinutes?: number | null;
   }) {
     super(args.message);
     this.name = "MetaApiError";
@@ -34,6 +38,7 @@ export class MetaApiError extends Error {
     this.type = args.type;
     this.httpStatus = args.httpStatus;
     this.fbtraceId = args.fbtraceId ?? null;
+    this.retryAfterMinutes = args.retryAfterMinutes ?? null;
   }
 }
 
@@ -42,13 +47,24 @@ const RATE_LIMIT_CODES = new Set([
   4, 17, 32, 613, 80000, 80001, 80002, 80003, 80004, 80005, 80006, 80008, 80009, 80014,
 ]);
 
+/** True when an error is Meta telling us to slow down (any rate-limit code). */
+export function isRateLimitError(err: unknown): err is MetaApiError & { code: number } {
+  return (
+    err instanceof MetaApiError && err.code != null && RATE_LIMIT_CODES.has(err.code)
+  );
+}
+
 /**
  * A user-facing message for a MetaApiError. Rate-limit codes (e.g. 17 "User request limit
- * reached") get a clear, actionable line instead of the raw text; everything else shows
- * the code + Meta's message.
+ * reached") get a clear, actionable line — with Meta's own regain estimate when the failing
+ * response carried one — instead of the raw text; everything else shows the code + message.
  */
 export function metaErrorToMessage(err: MetaApiError): string {
-  if (err.code != null && RATE_LIMIT_CODES.has(err.code)) {
+  if (isRateLimitError(err)) {
+    if (err.retryAfterMinutes && err.retryAfterMinutes > 0) {
+      const m = err.retryAfterMinutes;
+      return `Meta's API rate limit was reached. Try again in about ${m} minute${m === 1 ? "" : "s"}.`;
+    }
     return "Meta's API rate limit was reached — please wait a minute and try again.";
   }
   return `Meta API error (${err.code ?? "?"}): ${err.message}`;
@@ -94,44 +110,132 @@ interface MetaPagingResponse<T> {
   };
 }
 
-/**
- * Parse the X-Business-Use-Case-Usage header and log a compact summary. The header
- * is JSON keyed by ad-account id; each entry carries call_count, total_cputime,
- * total_time, estimated_time_to_regain_access. We log the worst-case so a future
- * queue can pace near 80% (the throttle guard lives in the write phase, later).
- */
-function logBusinessUseCaseUsage(headers: Headers, path: string): void {
-  const raw = headers.get("x-business-use-case-usage");
-  if (!raw) return;
-  try {
-    const parsed = JSON.parse(raw) as Record<
-      string,
-      Array<{
-        call_count?: number;
-        total_cputime?: number;
-        total_time?: number;
-        estimated_time_to_regain_access?: number;
-      }>
-    >;
-    let worst = 0;
-    let regain = 0;
-    for (const entries of Object.values(parsed)) {
-      for (const e of entries) {
-        worst = Math.max(worst, e.call_count ?? 0, e.total_cputime ?? 0, e.total_time ?? 0);
-        regain = Math.max(regain, e.estimated_time_to_regain_access ?? 0);
-      }
-    }
-    // eslint-disable-next-line no-console
-    console.info(
-      `[meta] BUC usage on ${path}: worst=${worst}% regain=${regain}min`,
-    );
-  } catch {
-    // eslint-disable-next-line no-console
-    console.warn(`[meta] could not parse x-business-use-case-usage on ${path}`);
-  }
+/** A snapshot of how close we are to Meta's rate limits, from response headers. */
+export interface MetaUsage {
+  /** Worst-case utilization percent across all usage headers (0-100+). */
+  utilizationPct: number;
+  /** Meta's estimate (minutes) until throttled access returns; 0 when not throttled. */
+  regainMinutes: number;
+  /** Date.now() when this was observed. */
+  observedAt: number;
 }
 
-async function throwMetaError(res: Response, path: string): Promise<never> {
+// Latest observed usage per ad-account id (no act_ prefix). Per-process, best-effort:
+// enough for the write loop to pace itself within one serverless invocation, which is
+// exactly where a burst of calls happens.
+const usageByAccount = new Map<string, MetaUsage>();
+
+/** The most recently observed usage for an ad account, or null before any call. */
+export function getMetaUsage(accountId: string): MetaUsage | null {
+  return usageByAccount.get(accountId) ?? null;
+}
+
+/**
+ * Parse Meta's three rate-limit headers into one worst-case snapshot:
+ *   - X-Business-Use-Case-Usage: JSON keyed by ad-account id; entries carry call_count /
+ *     total_cputime / total_time percents + estimated_time_to_regain_access (minutes).
+ *   - X-Ad-Account-Usage: { acc_id_util_pct, reset_time_duration (seconds) }.
+ *   - X-App-Usage: { call_count, total_time, total_cputime } percents.
+ * Returns null when no usage header is present.
+ */
+function parseUsageHeaders(headers: Headers): MetaUsage | null {
+  let worst = -1;
+  let regain = 0;
+
+  const buc = headers.get("x-business-use-case-usage");
+  if (buc) {
+    try {
+      const parsed = JSON.parse(buc) as Record<
+        string,
+        Array<{
+          call_count?: number;
+          total_cputime?: number;
+          total_time?: number;
+          estimated_time_to_regain_access?: number;
+        }>
+      >;
+      for (const entries of Object.values(parsed)) {
+        for (const e of entries) {
+          worst = Math.max(worst, e.call_count ?? 0, e.total_cputime ?? 0, e.total_time ?? 0);
+          regain = Math.max(regain, e.estimated_time_to_regain_access ?? 0);
+        }
+      }
+    } catch {
+      // unparseable header — fall through to the others
+    }
+  }
+
+  const acct = headers.get("x-ad-account-usage");
+  if (acct) {
+    try {
+      const parsed = JSON.parse(acct) as {
+        acc_id_util_pct?: number;
+        reset_time_duration?: number;
+      };
+      worst = Math.max(worst, parsed.acc_id_util_pct ?? 0);
+      regain = Math.max(regain, Math.ceil((parsed.reset_time_duration ?? 0) / 60));
+    } catch {
+      /* ignore */
+    }
+  }
+
+  const app = headers.get("x-app-usage");
+  if (app) {
+    try {
+      const parsed = JSON.parse(app) as {
+        call_count?: number;
+        total_time?: number;
+        total_cputime?: number;
+      };
+      worst = Math.max(
+        worst,
+        parsed.call_count ?? 0,
+        parsed.total_time ?? 0,
+        parsed.total_cputime ?? 0,
+      );
+    } catch {
+      /* ignore */
+    }
+  }
+
+  if (worst < 0) return null;
+  return { utilizationPct: worst, regainMinutes: regain, observedAt: Date.now() };
+}
+
+/**
+ * Record the usage headers from a response against the ad account the call touched
+ * (from the `act_<id>/...` path, else the BUC header's own account-id keys), log a
+ * compact summary, and return the snapshot so error paths can attach it.
+ */
+function recordUsage(headers: Headers, path: string): MetaUsage | null {
+  const usage = parseUsageHeaders(headers);
+  if (!usage) return null;
+
+  const ids = new Set<string>();
+  const fromPath = /^act_(\d+)\//.exec(path);
+  if (fromPath?.[1]) ids.add(fromPath[1]);
+  const buc = headers.get("x-business-use-case-usage");
+  if (buc) {
+    try {
+      for (const key of Object.keys(JSON.parse(buc) as Record<string, unknown>)) ids.add(key);
+    } catch {
+      /* ignore */
+    }
+  }
+  for (const id of ids) usageByAccount.set(id, usage);
+
+  // eslint-disable-next-line no-console
+  console.info(
+    `[meta] usage on ${path}: worst=${usage.utilizationPct}% regain=${usage.regainMinutes}min`,
+  );
+  return usage;
+}
+
+async function throwMetaError(
+  res: Response,
+  path: string,
+  usage: MetaUsage | null,
+): Promise<never> {
   let body: unknown = null;
   try {
     body = await res.json();
@@ -151,13 +255,19 @@ async function throwMetaError(res: Response, path: string): Promise<never> {
         }).error
       : null;
 
+  const code = err?.code ?? null;
   throw new MetaApiError({
     message: err?.message ?? `Meta API request to ${path} failed (HTTP ${res.status})`,
-    code: err?.code ?? null,
+    code,
     subcode: err?.error_subcode ?? null,
     type: err?.type ?? null,
     httpStatus: res.status,
     fbtraceId: err?.fbtrace_id ?? null,
+    // Only meaningful when Meta is throttling us; other errors leave it null.
+    retryAfterMinutes:
+      code != null && RATE_LIMIT_CODES.has(code) && usage && usage.regainMinutes > 0
+        ? usage.regainMinutes
+        : null,
   });
 }
 
@@ -177,10 +287,10 @@ async function getOnePage<T>(
     headers: { Accept: "application/json" },
   });
 
-  logBusinessUseCaseUsage(res.headers, path);
+  const usage = recordUsage(res.headers, path);
 
   if (!res.ok) {
-    await throwMetaError(res, path);
+    await throwMetaError(res, path, usage);
   }
   return (await res.json()) as MetaPagingResponse<T>;
 }
@@ -265,11 +375,124 @@ export async function post<T>(
     body,
   });
 
-  logBusinessUseCaseUsage(res.headers, path);
+  const usage = recordUsage(res.headers, path);
   if (!res.ok) {
-    await throwMetaError(res, path);
+    await throwMetaError(res, path, usage);
   }
   return (await res.json()) as T;
+}
+
+/** One operation inside a Graph batch call. */
+export interface BatchRequest {
+  method: "GET" | "POST";
+  /** e.g. "act_123/adcreatives" */
+  relativeUrl: string;
+  /** Form params; object/array values are JSON-stringified (Graph's convention). */
+  params?: Record<string, unknown>;
+  /** Batch op name — later ops can reference its result via `{result=<name>:$.id}`. */
+  name?: string;
+}
+
+/**
+ * Execute up to 50 Graph operations in ONE HTTP round trip (POST / with `batch`).
+ * Ops run in order and may reference earlier NAMED ops' responses via JSONPath
+ * (e.g. `{result=creative:$.id}`) — Meta's documented pattern for creating a
+ * creative + its ad together.
+ *
+ * IMPORTANT: each sub-operation still counts toward rate limits. Batching halves
+ * round-trip LATENCY, not quota — the pacing in the write loop stays load-bearing.
+ *
+ * Returns each op's parsed body in order (null for ops skipped because a
+ * dependency failed). Throws a typed MetaApiError for the FIRST failed op, so
+ * callers' rate-limit handling works exactly as with single calls.
+ */
+export async function postBatch<T = unknown>(
+  ops: BatchRequest[],
+  token: string,
+): Promise<(T | null)[]> {
+  const proof = appSecretProof(token);
+  const batch = ops.map((op) => {
+    const entry: Record<string, unknown> = {
+      method: op.method,
+      relative_url: op.relativeUrl,
+    };
+    if (op.name) {
+      entry.name = op.name;
+      // Named (referenced) ops have their responses omitted by default; we want
+      // them back so partial failures are attributable.
+      entry.omit_response_on_success = false;
+    }
+    if (op.params) {
+      const body = new URLSearchParams();
+      for (const [k, v] of Object.entries(op.params)) {
+        if (v === undefined || v === null) continue;
+        body.set(k, typeof v === "object" ? JSON.stringify(v) : String(v));
+      }
+      entry.body = body.toString();
+    }
+    return entry;
+  });
+
+  const body = new URLSearchParams();
+  body.set("batch", JSON.stringify(batch));
+  body.set("include_headers", "false");
+  body.set("access_token", token);
+  body.set("appsecret_proof", proof);
+
+  const res = await fetch(`${baseUrl()}/`, {
+    method: "POST",
+    cache: "no-store",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Accept: "application/json",
+    },
+    body,
+  });
+
+  const usage = recordUsage(res.headers, ops[0]?.relativeUrl ?? "(batch)");
+  if (!res.ok) {
+    await throwMetaError(res, "(batch)", usage);
+  }
+
+  const arr = (await res.json()) as Array<{ code?: number; body?: string } | null>;
+  const out: (T | null)[] = [];
+  for (const [i, item] of arr.entries()) {
+    if (!item) {
+      out.push(null); // dependency failed -> op skipped
+      continue;
+    }
+    let parsed: unknown = null;
+    try {
+      parsed = item.body ? JSON.parse(item.body) : null;
+    } catch {
+      // non-JSON op body
+    }
+    if (item.code != null && item.code >= 200 && item.code < 300) {
+      out.push(parsed as T);
+      continue;
+    }
+    // First failed op: surface it as a typed error (same shape as a single call).
+    const errObj =
+      parsed && typeof parsed === "object" && "error" in parsed
+        ? (parsed as { error: { message?: string; code?: number; error_subcode?: number; type?: string; fbtrace_id?: string } }).error
+        : null;
+    const code = errObj?.code ?? null;
+    throw new MetaApiError({
+      message:
+        errObj?.message ??
+        `Batch operation ${i} (${ops[i]?.relativeUrl ?? "?"}) failed (HTTP ${item.code ?? "?"})`,
+      code,
+      subcode: errObj?.error_subcode ?? null,
+      type: errObj?.type ?? null,
+      httpStatus: item.code ?? 500,
+      fbtraceId: errObj?.fbtrace_id ?? null,
+      retryAfterMinutes:
+        code != null && RATE_LIMIT_CODES.has(code) && usage && usage.regainMinutes > 0
+          ? usage.regainMinutes
+          : null,
+    });
+  }
+  return out;
 }
 
 /**
@@ -295,9 +518,9 @@ export async function getObject<T>(
     cache: "no-store",
     headers: { Accept: "application/json" },
   });
-  logBusinessUseCaseUsage(res.headers, path);
+  const usage = recordUsage(res.headers, path);
   if (!res.ok) {
-    await throwMetaError(res, path);
+    await throwMetaError(res, path, usage);
   }
   return (await res.json()) as T;
 }

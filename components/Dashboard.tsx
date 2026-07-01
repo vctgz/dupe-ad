@@ -279,6 +279,7 @@ export default function Dashboard({
             total={rows.length}
             source={discovery?.source ?? null}
             fetchedAt={discovery?.fetchedAt ?? null}
+            stale={discovery?.stale ?? false}
             splitPageCodes={discovery?.splitPageCodes ?? []}
             sgCount={sgCount}
             activeCount={activeCount}

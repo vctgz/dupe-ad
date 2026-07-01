@@ -137,6 +137,9 @@ export interface DiscoveryResult {
   unusedMappingCodes: string[];
   /** Optional human note, e.g. when no snapshot exists yet. */
   note?: string;
+  /** True when a live pull failed on Meta's rate limit and this is the last good
+   *  result served from cache instead. The UI pill shows "Cached". */
+  stale?: boolean;
   /** True when this account has Meta WRITE credentials configured (enables live
    *  ad creation). The data sources leave it undefined; the API route sets it. */
   writeEnabled?: boolean;

@@ -14,6 +14,7 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@vercel/blob": "^2.5.0",
     "lucide-react": "^0.400.0",
     "next": "^14.2.33",
     "papaparse": "5.4.1",

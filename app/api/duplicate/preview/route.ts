@@ -43,6 +43,9 @@ const bodySchema = z.object({
   accountSlug: z.string().min(1),
   campaignIds: z.array(z.string().min(1).max(64)).max(200).default([]),
   mode: z.enum(["duplicate", "create"]).default("duplicate"),
+  /** Ad format (echoed by the create flow). The plan is format-agnostic: it resolves
+   *  Pages/ad sets, which are the same for image, video, and carousel ads. */
+  format: z.enum(["single", "video", "carousel"]).optional(),
   /** Required in duplicate mode — the exact ad name to clone from each campaign. */
   adName: z.string().optional(),
   /** Optional: target only ad sets whose name contains this in each campaign. */

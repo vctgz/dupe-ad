@@ -84,9 +84,12 @@ const SOURCE_LABEL: Record<DiscoverySource, string> = {
 function SourcePill({
   source,
   fetchedAt,
+  stale = false,
 }: {
   source: DiscoverySource | null;
   fetchedAt: string | null;
+  /** Live pull was rate-limited; this is the last good result served from cache. */
+  stale?: boolean;
 }) {
   if (!source) {
     return (
@@ -95,18 +98,22 @@ function SourcePill({
       </span>
     );
   }
-  const live = source === "live";
+  const live = source === "live" && !stale;
   const stamp = fetchedAt ? new Date(fetchedAt).toLocaleString() : null;
+  const label = stale ? "Cached" : SOURCE_LABEL[source];
+  const title = stale
+    ? `Meta's rate limit blocked a fresh pull — showing the last good data${stamp ? ` from ${stamp}` : ""}.`
+    : stamp ?? undefined;
   return (
     <span
       className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-fas-pill border border-hairline bg-surface-sunken px-3 py-1 font-mono text-fas-11 leading-none text-ink-muted"
-      title={stamp ?? undefined}
+      title={title}
     >
       <span
         className={`h-1.5 w-1.5 shrink-0 rounded-fas-pill ${live ? "bg-health-ok" : "bg-ink-faint"}`}
         aria-hidden="true"
       />
-      <span className="uppercase tracking-caps-tight">{SOURCE_LABEL[source]}</span>
+      <span className="uppercase tracking-caps-tight">{label}</span>
       {stamp ? <span className="text-ink-faint">· {stamp}</span> : null}
     </span>
   );
@@ -117,6 +124,7 @@ export default function SummaryBar({
   total,
   source,
   fetchedAt,
+  stale = false,
   splitPageCodes,
   sgCount,
   activeCount,
@@ -129,6 +137,8 @@ export default function SummaryBar({
   total: number;
   source: DiscoverySource | null;
   fetchedAt: string | null;
+  /** Rate-limited live pull served from cache (shows "Cached" on the pill). */
+  stale?: boolean;
   splitPageCodes: string[];
   /** SG=Y count (store-list mode). */
   sgCount: number;
@@ -152,7 +162,7 @@ export default function SummaryBar({
           campaign{total === 1 ? "" : "s"}
         </span>
       </div>
-      <SourcePill source={source} fetchedAt={fetchedAt} />
+      <SourcePill source={source} fetchedAt={fetchedAt} stale={stale} />
     </div>
   );
 

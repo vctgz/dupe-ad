@@ -9,6 +9,8 @@ import { access } from "node:fs/promises";
 import path from "node:path";
 import type { AdAccount } from "@/config/accounts";
 import { getEnv, hasLiveCredentials } from "@/lib/env";
+import { isRateLimitError } from "@/lib/meta/client";
+import { kvGet, kvSet } from "@/lib/kv";
 import { loadSnapshot } from "@/lib/discovery/snapshot";
 import { loadLive } from "@/lib/discovery/live";
 import { buildStoreList } from "@/lib/discovery/mappingView";
@@ -38,6 +40,10 @@ async function snapshotExists(slug: string): Promise<boolean> {
 // modal -> preview -> create, plus the odd re-scan) otherwise re-pulls the whole account
 // from Meta several times and trips its per-user rate limit (error 17). Re-scan passes
 // forceFresh to bypass this; everything else reuses the recent pull.
+//
+// Two-tier: the in-process Map is L1; the optional shared KV store is L2, so a cold
+// start / sibling serverless instance reuses a recent pull instead of hitting Meta
+// again. Same TTL on both tiers — a KV hit is as fresh as a memory hit.
 const LIVE_TTL_MS = 90_000;
 const liveCache = new Map<string, { at: number; result: DiscoveryResult }>();
 
@@ -63,12 +69,31 @@ export async function resolveDiscoveryResult(
 
   let result: DiscoveryResult;
   if (source === "live") {
+    const kvKey = `dupe:live:${account.slug}`;
     const cached = liveCache.get(account.slug);
     if (!opts?.forceFresh && cached && Date.now() - cached.at < LIVE_TTL_MS) {
       result = cached.result;
     } else {
-      result = await loadLive(account);
-      liveCache.set(account.slug, { at: Date.now(), result });
+      const fromKv = opts?.forceFresh ? null : await kvGet<DiscoveryResult>(kvKey);
+      if (fromKv) {
+        liveCache.set(account.slug, { at: Date.now(), result: fromKv });
+        result = fromKv;
+      } else {
+        try {
+          result = await loadLive(account);
+          liveCache.set(account.slug, { at: Date.now(), result });
+          await kvSet(kvKey, result, LIVE_TTL_MS / 1000);
+        } catch (err) {
+          // Rate-limited live pull: serve the last good result (however old) marked
+          // stale, so the table degrades to "Cached" instead of failing outright.
+          // Any other failure, or no prior pull to fall back on, propagates as before.
+          if (cached && isRateLimitError(err)) {
+            result = { ...cached.result, stale: true };
+          } else {
+            throw err;
+          }
+        }
+      }
     }
   } else if (source === "mapping") {
     result = await buildStoreList(account.slug);
