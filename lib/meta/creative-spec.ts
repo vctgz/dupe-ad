@@ -315,25 +315,192 @@ export interface DuplicateOverrides {
   cta?: string;
 }
 
+/** Reverse of VIDEO_LABELS: our adlabel name → its aspect slot. */
+const PLACEMENT_BY_LABEL: Record<string, VideoPlacementKey> = Object.fromEntries(
+  (Object.entries(VIDEO_LABELS) as [VideoPlacementKey, string][]).map(([k, v]) => [v, k]),
+);
+
+/** The slot our adlabel scheme assigns this videos[] entry, or null if foreign. */
+function slotOfEntry(entry: Record<string, unknown>): VideoPlacementKey | null {
+  const labels = entry.adlabels as { name?: string }[] | undefined;
+  if (!Array.isArray(labels)) return null;
+  for (const l of labels) {
+    const slot = l?.name ? PLACEMENT_BY_LABEL[l.name] : undefined;
+    if (slot) return slot;
+  }
+  return null;
+}
+
+/** The thumbnail fields (`thumbnail_hash`/`thumbnail_url`) reusable from an entry. */
+function thumbOfEntry(entry: Record<string, unknown>): Record<string, unknown> | null {
+  if (entry.thumbnail_hash) return { thumbnail_hash: entry.thumbnail_hash };
+  if (entry.thumbnail_url) return { thumbnail_url: entry.thumbnail_url };
+  return null;
+}
+
+/**
+ * Apply per-aspect VIDEO replacements to a source creative before cloning it.
+ * The operator's contract: an empty slot keeps the source ad's video for that
+ * placement; a filled slot swaps in the newly registered (account-scoped) video.
+ *
+ * How the merge lands depends on the source's shape:
+ *   ours (asset_feed_spec, our VID_* labels)  — swap matching slots' video_id in
+ *     place; APPEND new slots (reusing the source thumbnail) and rebuild the
+ *     placement rules from the merged slot set (only when the set grew).
+ *   foreign asset_feed_spec — no way to know which entry is which ratio: ONE
+ *     override replaces every entry's video (labels/rules untouched); 2+ replace
+ *     the whole video set with our labeled slots + our rules.
+ *   single video_data — one override swaps the video in place; 2+ rebuild the
+ *     creative as a fresh multi-ratio asset_feed_spec from the source's own
+ *     copy/CTA/thumbnail.
+ *   not a video ad — throws (surfaced as that store's per-row error).
+ */
+function applyVideoOverrides(
+  source: DuplicateSourceCreative,
+  overrides: VideoPlacement[],
+): DuplicateSourceCreative {
+  if (source.assetFeedSpec) {
+    const afs = cloneJson(source.assetFeedSpec);
+    const entries = Array.isArray(afs.videos)
+      ? (afs.videos as Record<string, unknown>[])
+      : null;
+    if (!entries || entries.length === 0) {
+      throw new Error(
+        "The source ad's creative carries no videos to replace — it may be an image ad.",
+      );
+    }
+
+    const allOurs = entries.every((e) => slotOfEntry(e) !== null);
+    if (allOurs) {
+      const byPlacement = new Map<VideoPlacementKey, Record<string, unknown>>();
+      for (const e of entries) byPlacement.set(slotOfEntry(e)!, e);
+      let grew = false;
+      for (const o of overrides) {
+        const existing = byPlacement.get(o.placement);
+        if (existing) {
+          existing.video_id = o.videoId;
+          continue;
+        }
+        const thumb = thumbOfEntry(entries[0]!);
+        if (!thumb) {
+          throw new Error(
+            "The source ad has no reusable thumbnail for the newly added ratio.",
+          );
+        }
+        const added: Record<string, unknown> = {
+          video_id: o.videoId,
+          ...thumb,
+          adlabels: [{ name: VIDEO_LABELS[o.placement] }],
+        };
+        entries.push(added);
+        byPlacement.set(o.placement, added);
+        grew = true;
+      }
+      // A pure swap keeps the source's own (already-valid) rules; a grown slot set
+      // needs rules covering the new ratio's placements.
+      if (grew) {
+        afs.asset_customization_rules = buildVideoAssetRules(new Set(byPlacement.keys()));
+      }
+    } else if (overrides.length === 1) {
+      // Foreign labels, one new video: serve it everywhere the old ones did.
+      for (const e of entries) e.video_id = overrides[0]!.videoId;
+    } else {
+      // Foreign labels, full replacement: our labeled slots + our placement rules.
+      const thumb = thumbOfEntry(entries[0]!);
+      if (!thumb) {
+        throw new Error("The source ad has no reusable thumbnail for the replacement videos.");
+      }
+      afs.videos = overrides.map((o) => ({
+        video_id: o.videoId,
+        ...thumb,
+        adlabels: [{ name: VIDEO_LABELS[o.placement] }],
+      }));
+      afs.ad_formats = ["SINGLE_VIDEO"];
+      afs.optimization_type = "PLACEMENT";
+      afs.asset_customization_rules = buildVideoAssetRules(
+        new Set(overrides.map((o) => o.placement)),
+      );
+    }
+    return { objectStorySpec: source.objectStorySpec, assetFeedSpec: afs };
+  }
+
+  const vd = source.objectStorySpec?.video_data as Record<string, unknown> | undefined;
+  if (vd) {
+    if (overrides.length === 1) {
+      const oss = cloneJson(source.objectStorySpec!);
+      (oss.video_data as Record<string, unknown>).video_id = overrides[0]!.videoId;
+      return { objectStorySpec: oss, assetFeedSpec: null };
+    }
+    // 2+ ratios on a single-video source: rebuild as a multi-ratio asset_feed_spec
+    // from the source's own copy, CTA, and thumbnail.
+    const cta = vd.call_to_action as
+      | { type?: unknown; value?: { link?: unknown } }
+      | undefined;
+    if (!cta?.type || !cta.value?.link) {
+      throw new Error(
+        "The source video ad has no call-to-action link to carry — can't rebuild it multi-ratio.",
+      );
+    }
+    const thumb = vd.image_hash
+      ? { thumbnail_hash: vd.image_hash }
+      : vd.image_url
+        ? { thumbnail_url: vd.image_url }
+        : null;
+    if (!thumb) {
+      throw new Error("The source video ad has no thumbnail to reuse for the new ratios.");
+    }
+    const afs: Record<string, unknown> = {
+      ad_formats: ["SINGLE_VIDEO"],
+      optimization_type: "PLACEMENT",
+      videos: overrides.map((o) => ({
+        video_id: o.videoId,
+        ...thumb,
+        adlabels: [{ name: VIDEO_LABELS[o.placement] }],
+      })),
+      bodies: [{ text: vd.message ?? "" }],
+      titles: [{ text: vd.title ?? "" }],
+      descriptions: [{ text: vd.link_description ?? "" }],
+      link_urls: [{ website_url: cta.value.link }],
+      call_to_action_types: [cta.type],
+      asset_customization_rules: buildVideoAssetRules(
+        new Set(overrides.map((o) => o.placement)),
+      ),
+    };
+    return { objectStorySpec: source.objectStorySpec, assetFeedSpec: afs };
+  }
+
+  throw new Error(
+    "The source ad isn't a video ad — clear the video overrides or duplicate a video ad name.",
+  );
+}
+
 /**
  * Build fresh `POST .../adcreatives` params for DUPLICATE mode. Starts from a deep
  * clone of the SOURCE ad's own creative, rebinds the page/IG identity to the
  * DESTINATION store's own (freshly resolved — never trusted from the old creative,
  * in case the store's page changed since), and patches in only the copy/link/CTA
- * fields the operator explicitly overrode.
+ * fields — and per-aspect video slots (`videoOverrides`) — the operator explicitly
+ * overrode.
  */
 export function buildDuplicateCreativeParams(args: {
   pageId: string;
   instagramUserId?: string | null;
   source: DuplicateSourceCreative;
   overrides: DuplicateOverrides;
+  /** Per-aspect video replacements; empty/omitted keeps the source ad's videos. */
+  videoOverrides?: VideoPlacement[];
 }): Record<string, unknown> {
-  const { pageId, instagramUserId, source, overrides } = args;
+  const { pageId, instagramUserId, overrides } = args;
   const name = `${overrides.adName} — creative`;
 
-  if (!source.objectStorySpec && !source.assetFeedSpec) {
+  if (!args.source.objectStorySpec && !args.source.assetFeedSpec) {
     throw new Error("The source ad has no readable creative to duplicate.");
   }
+
+  const source =
+    args.videoOverrides && args.videoOverrides.length > 0
+      ? applyVideoOverrides(args.source, args.videoOverrides)
+      : args.source;
 
   // Multi-aspect source (today: our own 1-3 ratio video ads) — reuse the labeled
   // asset array + placement rules VERBATIM (account-scoped ids are already valid

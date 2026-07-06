@@ -954,9 +954,12 @@ export default function DuplicateModal({
   const canPreview = n > 0 && !previewing && (isCreate ? createReady : adNameOk);
   // Live create is gated on: real write creds, a complete form for the mode (create
   // needs every field; duplicate needs only the source ad name — its creative is
-  // cloned, not typed), and not already busy.
+  // cloned, not typed — plus no video override still mid-pipeline), and not busy.
   const canCreate =
-    writeEnabled && (isCreate ? createReady : adNameOk) && phase === "idle" && !previewing;
+    writeEnabled &&
+    (isCreate ? createReady : adNameOk && !anyVideoBusy) &&
+    phase === "idle" &&
+    !previewing;
 
   // Escape to close, plus full focus management: on open, save the previously
   // focused element and move focus into the dialog (first field); trap Tab inside
@@ -1416,16 +1419,22 @@ export default function DuplicateModal({
             })),
           )
         : undefined;
-      // One entry per uploaded, ready slot (in canonical slot order). 2+ serve per
-      // placement; a single slot keeps the proven single-video creative.
+      // One entry per uploaded, ready slot (in canonical slot order). Create/video:
+      // the ad's own videos (2+ serve per placement; 1 keeps the single-video
+      // creative). Duplicate: OPTIONAL per-aspect overrides — sent only when at
+      // least one slot was filled; empty means every ratio carries over from each
+      // store's source ad.
+      const readyVideoSlots = VIDEO_SLOTS.flatMap((s) => {
+        const v = videos[s.key];
+        return v?.phase === "ready" && v.videoId
+          ? [{ placement: s.key, videoId: v.videoId }]
+          : [];
+      });
       const videoPayload = isVideo
-        ? VIDEO_SLOTS.flatMap((s) => {
-            const v = videos[s.key];
-            return v?.phase === "ready" && v.videoId
-              ? [{ placement: s.key, videoId: v.videoId }]
-              : [];
-          })
-        : undefined;
+        ? readyVideoSlots
+        : !isCreate && readyVideoSlots.length > 0
+          ? readyVideoSlots
+          : undefined;
       const payloadBase = {
         accountSlug,
         mode,
@@ -1789,6 +1798,33 @@ export default function DuplicateModal({
             ) : null}
           </div>
 
+          {/* Duplicate mode: OPTIONAL per-aspect video replacements. An empty slot
+              keeps that ratio's video from each store's own source ad; a filled slot
+              swaps in the new video. Needs write creds (uploads register against the
+              ad account immediately), so hidden without them. */}
+          {!isCreate && writeEnabled ? (
+            <div className="flex flex-col gap-3">
+              <span className="text-fas-11 font-semibold uppercase tracking-caps text-ink-faint">
+                Video overrides (optional)
+              </span>
+              <div className="grid grid-cols-1 items-start gap-4 sm:grid-cols-3">
+                {VIDEO_SLOTS.map((s) => (
+                  <VideoDropzone
+                    key={s.key}
+                    slot={s}
+                    video={videos[s.key]}
+                    onPick={(file) => pickVideo(s, file)}
+                    onClear={() => clearVideo(s.key)}
+                  />
+                ))}
+              </div>
+              <p className="text-fas-11 text-ink-muted">
+                Only for duplicating video ads. Leave a slot empty to keep that ratio&apos;s
+                video from each store&apos;s source ad; drop a file to replace it everywhere.
+              </p>
+            </div>
+          ) : null}
+
           <Field
             label="Primary text"
             helper="Main body / top text (maps to link_data.message)."
@@ -1932,7 +1968,7 @@ export default function DuplicateModal({
               <>
                 {" "}
                 — each store&apos;s own <span className="font-mono text-ink-mono">{adName || "…"}</span> ad, cloned
-                as-is (any typed copy above overrides just that field).{" "}
+                as-is (any typed copy or uploaded video above overrides just that piece).{" "}
               </>
             )}
             Each is created <span className="font-semibold text-ink">PAUSED</span> — nothing goes live until you
@@ -1980,7 +2016,9 @@ export default function DuplicateModal({
                       : undefined
                     : !adNameOk
                       ? "Enter the exact ad name to duplicate."
-                      : undefined
+                      : anyVideoBusy
+                        ? "Wait for the override video(s) to finish processing."
+                        : undefined
               }
               className="fas-focus inline-flex items-center gap-2 rounded-fas-md bg-accent px-4 py-2 text-fas-13 font-semibold text-ink-on-accent transition-colors duration-[110ms] ease-fas hover:bg-accent-hover active:bg-accent-pressed disabled:cursor-not-allowed disabled:bg-surface-sunken disabled:text-ink-faint disabled:hover:bg-surface-sunken"
             >

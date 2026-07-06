@@ -424,3 +424,220 @@ test("duplicate: carousel — child_attachments untouched even when headline/sub
   ]);
   assert.equal(ld.multi_share_optimized, false);
 });
+
+// ── buildDuplicateCreativeParams — per-aspect video overrides ─────────────────
+
+/** A 2-slot source asset_feed_spec using OUR labels, as our Create flow builds it. */
+function ourAfsSource(): DuplicateSourceCreative {
+  return {
+    objectStorySpec: { page_id: "PAGE_SOURCE" },
+    assetFeedSpec: {
+      ad_formats: ["SINGLE_VIDEO"],
+      optimization_type: "PLACEMENT",
+      videos: [
+        { video_id: "V_SQ", thumbnail_hash: "T", adlabels: [{ name: "VID_SQUARE" }] },
+        { video_id: "V_VT", thumbnail_hash: "T", adlabels: [{ name: "VID_VERTICAL" }] },
+      ],
+      bodies: [{ text: "Body" }],
+      titles: [{ text: "Title" }],
+      descriptions: [{ text: "Desc" }],
+      link_urls: [{ website_url: "https://example.com/x" }],
+      call_to_action_types: ["SHOP_NOW"],
+      asset_customization_rules: [
+        { priority: 1, video_label: { name: "VID_VERTICAL" }, customization_spec: {} },
+        { priority: 2, video_label: { name: "VID_SQUARE" }, customization_spec: {} },
+      ],
+    },
+  };
+}
+
+test("override: swap one slot on our multi-ratio ad — id replaced, rules untouched", () => {
+  const source = ourAfsSource();
+  const originalRules = JSON.parse(JSON.stringify(source.assetFeedSpec!.asset_customization_rules));
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source,
+    overrides: { adName: "Spring Sale" },
+    videoOverrides: [{ placement: "vertical", videoId: "V_NEW" }],
+  }) as any;
+  const vids = params.asset_feed_spec.videos;
+  assert.equal(vids.find((v: any) => v.adlabels[0].name === "VID_VERTICAL").video_id, "V_NEW");
+  assert.equal(vids.find((v: any) => v.adlabels[0].name === "VID_SQUARE").video_id, "V_SQ");
+  // Pure swap: the source's own placement rules survive verbatim.
+  assert.deepEqual(params.asset_feed_spec.asset_customization_rules, originalRules);
+});
+
+test("override: add a NEW slot to our multi-ratio ad — entry appended, rules rebuilt", () => {
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source: ourAfsSource(),
+    overrides: { adName: "Spring Sale" },
+    videoOverrides: [{ placement: "horizontal", videoId: "V_HZ" }],
+  }) as any;
+  const vids = params.asset_feed_spec.videos;
+  assert.equal(vids.length, 3);
+  const added = vids.find((v: any) => v.adlabels[0].name === "VID_HORIZONTAL");
+  assert.equal(added.video_id, "V_HZ");
+  assert.equal(added.thumbnail_hash, "T"); // thumbnail reused from the source
+  // Rules re-derived to cover all three slots, each label present in videos[].
+  const rules = params.asset_feed_spec.asset_customization_rules;
+  assert.equal(rules.length, 3);
+  const labels = new Set(vids.map((v: any) => v.adlabels[0].name));
+  for (const r of rules) assert.ok(labels.has(r.video_label.name));
+});
+
+test("override: foreign-labeled asset_feed_spec + ONE video — serves it everywhere, rules kept", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: { page_id: "PAGE_SOURCE" },
+    assetFeedSpec: {
+      videos: [
+        { video_id: "F1", thumbnail_url: "https://cdn/th.jpg", adlabels: [{ name: "their_story" }] },
+        { video_id: "F2", thumbnail_url: "https://cdn/th.jpg", adlabels: [{ name: "their_feed" }] },
+      ],
+      asset_customization_rules: [
+        { priority: 1, video_label: { name: "their_story" }, customization_spec: {} },
+        { priority: 2, video_label: { name: "their_feed" }, customization_spec: {} },
+      ],
+    },
+  };
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source,
+    overrides: { adName: "Spring Sale" },
+    videoOverrides: [{ placement: "square", videoId: "V_NEW" }],
+  }) as any;
+  const vids = params.asset_feed_spec.videos;
+  // Both entries now carry the new video; foreign labels + rules stay intact.
+  assert.deepEqual(vids.map((v: any) => v.video_id), ["V_NEW", "V_NEW"]);
+  assert.deepEqual(vids.map((v: any) => v.adlabels[0].name), ["their_story", "their_feed"]);
+  assert.equal(params.asset_feed_spec.asset_customization_rules.length, 2);
+});
+
+test("override: foreign-labeled asset_feed_spec + TWO videos — wholesale replace with our labels/rules", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: { page_id: "PAGE_SOURCE" },
+    assetFeedSpec: {
+      videos: [{ video_id: "F1", thumbnail_hash: "TH", adlabels: [{ name: "their_label" }] }],
+      asset_customization_rules: [{ priority: 1, video_label: { name: "their_label" } }],
+    },
+  };
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source,
+    overrides: { adName: "Spring Sale" },
+    videoOverrides: [
+      { placement: "square", videoId: "V_SQ" },
+      { placement: "vertical", videoId: "V_VT" },
+    ],
+  }) as any;
+  const afs = params.asset_feed_spec;
+  assert.deepEqual(afs.videos, [
+    { video_id: "V_SQ", thumbnail_hash: "TH", adlabels: [{ name: "VID_SQUARE" }] },
+    { video_id: "V_VT", thumbnail_hash: "TH", adlabels: [{ name: "VID_VERTICAL" }] },
+  ]);
+  assert.deepEqual(afs.ad_formats, ["SINGLE_VIDEO"]);
+  assert.equal(afs.optimization_type, "PLACEMENT");
+  assert.ok(afs.asset_customization_rules.length >= 2);
+  for (const r of afs.asset_customization_rules) {
+    assert.ok(["VID_SQUARE", "VID_VERTICAL"].includes(r.video_label.name));
+  }
+});
+
+test("override: single video_data + one slot — video swapped in place, shape kept", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: {
+      page_id: "PAGE_SOURCE",
+      video_data: {
+        video_id: "V_OLD",
+        image_hash: "THUMB",
+        title: "T",
+        message: "M",
+        call_to_action: { type: "SHOP_NOW", value: { link: "https://example.com/x" } },
+      },
+    },
+    assetFeedSpec: null,
+  };
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source,
+    overrides: { adName: "Spring Sale" },
+    videoOverrides: [{ placement: "vertical", videoId: "V_NEW" }],
+  }) as any;
+  assert.equal(params.asset_feed_spec, undefined);
+  assert.equal(params.object_story_spec.video_data.video_id, "V_NEW");
+  assert.equal(params.object_story_spec.video_data.image_hash, "THUMB");
+});
+
+test("override: single video_data + two slots — rebuilt as multi-ratio asset_feed_spec", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: {
+      page_id: "PAGE_SOURCE",
+      video_data: {
+        video_id: "V_OLD",
+        image_hash: "THUMB",
+        title: "Old title",
+        message: "Old body",
+        link_description: "Old sub",
+        call_to_action: { type: "SHOP_NOW", value: { link: "https://example.com/x" } },
+      },
+    },
+    assetFeedSpec: null,
+  };
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source,
+    overrides: { adName: "Spring Sale" },
+    videoOverrides: [
+      { placement: "square", videoId: "V_SQ" },
+      { placement: "vertical", videoId: "V_VT" },
+    ],
+  }) as any;
+  const afs = params.asset_feed_spec;
+  // Copy/CTA/thumbnail all inherited from the source video_data.
+  assert.deepEqual(afs.bodies, [{ text: "Old body" }]);
+  assert.deepEqual(afs.titles, [{ text: "Old title" }]);
+  assert.deepEqual(afs.link_urls, [{ website_url: "https://example.com/x" }]);
+  assert.deepEqual(afs.call_to_action_types, ["SHOP_NOW"]);
+  assert.deepEqual(afs.videos, [
+    { video_id: "V_SQ", thumbnail_hash: "THUMB", adlabels: [{ name: "VID_SQUARE" }] },
+    { video_id: "V_VT", thumbnail_hash: "THUMB", adlabels: [{ name: "VID_VERTICAL" }] },
+  ]);
+  assert.ok(afs.asset_customization_rules.length >= 2);
+  // Identity-only story spec (video_data must NOT survive alongside asset_feed_spec).
+  assert.deepEqual(params.object_story_spec, { page_id: "PAGE_DEST", instagram_user_id: "IG_DEST" });
+});
+
+test("override: text overrides compose with video overrides", () => {
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source: ourAfsSource(),
+    overrides: { adName: "Spring Sale", primaryText: "Fresh body" },
+    videoOverrides: [{ placement: "square", videoId: "V_NEW" }],
+  }) as any;
+  assert.deepEqual(params.asset_feed_spec.bodies, [{ text: "Fresh body" }]);
+  assert.equal(
+    params.asset_feed_spec.videos.find((v: any) => v.adlabels[0].name === "VID_SQUARE").video_id,
+    "V_NEW",
+  );
+  assert.deepEqual(params.asset_feed_spec.titles, [{ text: "Title" }]); // untouched
+});
+
+test("override: non-video source ad throws (per-store error, not silent conversion)", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: {
+      page_id: "PAGE_SOURCE",
+      link_data: { message: "M", link: "https://example.com/x", image_hash: "IMG" },
+    },
+    assetFeedSpec: null,
+  };
+  assert.throws(
+    () =>
+      buildDuplicateCreativeParams({
+        ...DEST,
+        source,
+        overrides: { adName: "Spring Sale" },
+        videoOverrides: [{ placement: "square", videoId: "V_NEW" }],
+      }),
+    /isn't a video ad/,
+  );
+});
