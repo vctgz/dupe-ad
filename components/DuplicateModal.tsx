@@ -952,9 +952,11 @@ export default function DuplicateModal({
     (isCarousel || (headline.trim().length > 0 && subheadline.trim().length > 0));
   const createReady = adNameOk && linkOk && copyOk && ctaOk && mediaOk;
   const canPreview = n > 0 && !previewing && (isCreate ? createReady : adNameOk);
-  // Live create is gated on: create mode, real write creds, a complete form, and
-  // not already busy. Duplicate-mode live cloning is a deliberate follow-up.
-  const canCreate = isCreate && writeEnabled && createReady && phase === "idle" && !previewing;
+  // Live create is gated on: real write creds, a complete form for the mode (create
+  // needs every field; duplicate needs only the source ad name — its creative is
+  // cloned, not typed), and not already busy.
+  const canCreate =
+    writeEnabled && (isCreate ? createReady : adNameOk) && phase === "idle" && !previewing;
 
   // Escape to close, plus full focus management: on open, save the previously
   // focused element and move focus into the dialog (first field); trap Tab inside
@@ -1858,7 +1860,7 @@ export default function DuplicateModal({
                 onChange={(e) => setLink(e.target.value)}
                 placeholder="https://www.example.com/store-name"
                 required={isCreate}
-                aria-invalid={isCreate && link.trim().length > 0 && !linkOk}
+                aria-invalid={link.trim().length > 0 && !linkOk}
                 className="fas-focus w-full rounded-fas-md border border-hairline bg-surface px-3.5 py-2.5 text-fas-14 text-ink placeholder:text-ink-muted aria-[invalid=true]:border-status-mismatch aria-[invalid=true]:focus:border-status-mismatch"
               />
             </Field>
@@ -1920,14 +1922,22 @@ export default function DuplicateModal({
         {/* Footer actions — one explicit step. Every ad is PAUSED (reversible), so no
             separate confirm gate; the caption + count make the scale clear up front. */}
         <div className="flex shrink-0 flex-col gap-2.5 border-t border-hairline px-5 py-4">
-          {isCreate ? (
-            <p className="text-fas-12 text-ink-muted">
-              Creates <span className="font-semibold text-ink">{n}</span> paused ad{n === 1 ? "" : "s"} across{" "}
-              <span className="font-semibold text-ink">{storeCount}</span> store{storeCount === 1 ? "" : "s"}. Each is
-              created <span className="font-semibold text-ink">PAUSED</span> — nothing goes live until you activate it
-              in Ads Manager.
-            </p>
-          ) : null}
+          <p className="text-fas-12 text-ink-muted">
+            {isCreate ? "Creates" : "Duplicates"} <span className="font-semibold text-ink">{n}</span> paused ad
+            {n === 1 ? "" : "s"} across <span className="font-semibold text-ink">{storeCount}</span> store
+            {storeCount === 1 ? "" : "s"}
+            {isCreate ? (
+              ". "
+            ) : (
+              <>
+                {" "}
+                — each store&apos;s own <span className="font-mono text-ink-mono">{adName || "…"}</span> ad, cloned
+                as-is (any typed copy above overrides just that field).{" "}
+              </>
+            )}
+            Each is created <span className="font-semibold text-ink">PAUSED</span> — nothing goes live until you
+            activate it in Ads Manager.
+          </p>
           <div className="flex items-center justify-end gap-2.5">
             {/* SECONDARY — the no-write dry-run. */}
             <button
@@ -1956,11 +1966,10 @@ export default function DuplicateModal({
               onClick={() => void doCreate()}
               disabled={!canCreate}
               title={
-                !isCreate
-                  ? "Live duplication is coming next — use Preview for now."
-                  : !writeEnabled
-                    ? "Add a Meta write token (META_SYSTEM_USER_TOKEN) to enable live creation."
-                    : !createReady
+                !writeEnabled
+                  ? "Add a Meta write token (META_SYSTEM_USER_TOKEN) to enable live creation."
+                  : isCreate
+                    ? !createReady
                       ? isVideo
                         ? anyVideoBusy
                           ? "Wait for the video(s) to finish processing."
@@ -1969,19 +1978,28 @@ export default function DuplicateModal({
                           ? "Every card needs a square image and a headline (2 cards minimum)."
                           : "Fill every required field (and add an image) first."
                       : undefined
+                    : !adNameOk
+                      ? "Enter the exact ad name to duplicate."
+                      : undefined
               }
               className="fas-focus inline-flex items-center gap-2 rounded-fas-md bg-accent px-4 py-2 text-fas-13 font-semibold text-ink-on-accent transition-colors duration-[110ms] ease-fas hover:bg-accent-hover active:bg-accent-pressed disabled:cursor-not-allowed disabled:bg-surface-sunken disabled:text-ink-faint disabled:hover:bg-surface-sunken"
             >
               {phase === "creating" ? (
                 <RotateCw size={14} strokeWidth={2} aria-hidden="true" className="animate-spin" />
-              ) : (
+              ) : isCreate ? (
                 <Plus size={14} strokeWidth={2} aria-hidden="true" />
+              ) : (
+                <Copy size={14} strokeWidth={2} aria-hidden="true" />
               )}
               {phase === "creating"
                 ? createProgress && createProgress.total > CREATE_CHUNK
-                  ? `Creating… ${createProgress.done}/${createProgress.total}`
-                  : "Creating…"
-                : `Create ${n} paused ad${n === 1 ? "" : "s"}`}
+                  ? `${isCreate ? "Creating" : "Duplicating"}… ${createProgress.done}/${createProgress.total}`
+                  : isCreate
+                    ? "Creating…"
+                    : "Duplicating…"
+                : isCreate
+                  ? `Create ${n} paused ad${n === 1 ? "" : "s"}`
+                  : `Duplicate ${n} paused ad${n === 1 ? "" : "s"}`}
             </button>
           </div>
         </div>

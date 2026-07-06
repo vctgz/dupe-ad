@@ -12,9 +12,17 @@
 //   - results are PER-STORE — one store failing never blocks the rest, and we never
 //     claim blanket success.
 //
-// Scope: the from-scratch "Create new" flow (static image, video, or carousel).
-// Video ships per-placement asset_feed_spec (1-3 aspect ratios); the same multi-aspect
-// treatment for STATIC IMAGES and live duplicate-mode cloning remain follow-ups.
+// Scope: two engines, one write path.
+//   Create    — from-scratch ad from freshly uploaded media (static image, video
+//               with 1-3 aspect ratios, or carousel).
+//   Duplicate — clones an EXISTING ad (found by exact name in each selected
+//               campaign) onto that same store's Page, reusing its own
+//               account-scoped assets as-is; only explicit copy/link/CTA
+//               overrides change (see lib/meta/write.ts findSourceAdCreative /
+//               buildDuplicateCreativeParams).
+// Multi-placement asset_feed_spec for STATIC IMAGES in Create mode is still a
+// follow-up (video already ships it; Duplicate carries over whatever format the
+// source ad already has).
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { getAccountBySlug } from "@/config/accounts";
@@ -31,8 +39,11 @@ import {
 } from "@/lib/meta/client";
 import {
   base64FromDataUrl,
+  buildCreativeParams,
+  buildDuplicateCreativeParams,
   createCreativeAndPausedAd,
   fetchAdsetsByCampaign,
+  findSourceAdCreative,
   getVideoStatus,
   pickAdsetFromList,
   resolveTrackingPixelId,
@@ -91,12 +102,14 @@ const bodySchema = z
     // Cap fan-out: bounds how many live writes a single request can trigger. Each
     // campaign is 2-3 serialized Graph calls, so 200 keeps a single run well-bounded.
     campaignIds: z.array(z.string().min(1).max(64)).min(1).max(200),
+    // Create mode requires primaryText + link (enforced in superRefine, gated on
+    // mode==="create"); Duplicate mode treats every field here as an OPTIONAL
+    // override — blank means "keep the source ad's own value".
     creative: z.object({
-      primaryText: z.string().min(1).max(2000),
-      // Required for single/video (superRefine); unused by carousel (cards have their own).
+      primaryText: z.string().max(2000).default(""),
       headline: z.string().max(255).default(""),
       subheadline: z.string().max(255).default(""),
-      link: z.string().min(1).max(2048),
+      link: z.string().max(2048).default(""),
       cta: z.enum(CTA_TYPES).optional(),
     }),
     // Single: the ad image(s). Video: the REQUIRED thumbnail (square preferred).
@@ -121,6 +134,11 @@ const bodySchema = z
       .optional(),
   })
   .superRefine((val, ctx) => {
+    // Duplicate mode clones an already-valid creative and only patches explicit
+    // overrides — none of Create's format/media requiredness applies. Only adName
+    // (unconditionally required above) matters: it's the source ad to find.
+    if (val.mode !== "create") return;
+
     if (val.format !== "carousel") {
       if (val.images.length === 0) {
         ctx.addIssue({
@@ -142,6 +160,20 @@ const bodySchema = z
           });
         }
       }
+    }
+    if (val.creative.primaryText.trim().length === 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["creative", "primaryText"],
+        message: "Primary text is required.",
+      });
+    }
+    if (val.creative.link.trim().length === 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["creative", "link"],
+        message: "A destination URL is required.",
+      });
     }
     if (val.format === "video") {
       // Accept the new `videos[]` or the legacy `videoId` (normalized later).
@@ -268,14 +300,17 @@ export async function POST(
   if (!authz.ok) {
     return NextResponse.json({ error: authz.error }, { status: authz.status });
   }
-  if (mode !== "create") {
+  // Create requires a valid destination URL (superRefine already required it
+  // non-blank). Duplicate treats it as an OPTIONAL override — validated only when
+  // the operator actually typed one; blank means "keep the source ad's own link".
+  if (mode === "create" && !isHttpUrl(creative.link)) {
+    return NextResponse.json({ error: "A valid http(s) destination URL is required." }, { status: 400 });
+  }
+  if (mode === "duplicate" && creative.link.trim().length > 0 && !isHttpUrl(creative.link)) {
     return NextResponse.json(
-      { error: "Live writes currently support the Create flow only. Duplicate is coming next." },
+      { error: "The destination URL override is not a valid http(s) URL." },
       { status: 400 },
     );
-  }
-  if (!isHttpUrl(creative.link)) {
-    return NextResponse.json({ error: "A valid http(s) destination URL is required." }, { status: 400 });
   }
 
   const account = getAccountBySlug(accountSlug);
@@ -336,124 +371,128 @@ export async function POST(
   //   single   — one image;
   //   video    — the thumbnail image + a READY registered video;
   //   carousel — one image per card (2-10).
-  let content: CreativeContent;
-  if (format === "carousel") {
-    const cardsIn = cards ?? [];
-    const decoded: { base64: string; headline: string; description?: string; link?: string }[] =
-      [];
-    for (const [i, card] of cardsIn.entries()) {
-      if (card.link && !isHttpUrl(card.link)) {
-        return NextResponse.json(
-          { error: `Card ${i + 1}: the link is not a valid http(s) URL.` },
-          { status: 400 },
-        );
-      }
-      const b64 = base64FromDataUrl(card.dataUrl);
-      if (!b64) {
-        return NextResponse.json(
-          { error: `Card ${i + 1}: the image must be a base64 image data URL.` },
-          { status: 400 },
-        );
-      }
-      if (b64.length > 10_000_000) {
-        return NextResponse.json(
-          { error: `Card ${i + 1}: the image is too large (over ~7MB).` },
-          { status: 413 },
-        );
-      }
-      decoded.push({
-        base64: b64,
-        headline: card.headline,
-        description: card.description,
-        link: card.link,
-      });
-    }
-    const cardSpecs: CarouselCardSpec[] = [];
-    try {
-      for (const d of decoded) {
-        cardSpecs.push({
-          imageHash: await uploadImage(account, token, d.base64),
-          headline: d.headline,
-          description: d.description,
-          link: d.link,
-        });
-      }
-    } catch (err) {
-      const msg =
-        err instanceof MetaApiError
-          ? metaErrorToMessage(err)
-          : err instanceof Error
-            ? err.message
-            : "Image upload failed";
-      return NextResponse.json(
-        { error: `Could not upload the image for card ${cardSpecs.length + 1}: ${msg}` },
-        { status: 502 },
-      );
-    }
-    content = { kind: "carousel", cards: cardSpecs };
-  } else {
-    // Pick one image (square preferred), decode it, and reject anything oversized.
-    // For video ads this image is the REQUIRED thumbnail.
-    const chosen = images.find((i) => i.placement === "square") ?? images[0]!;
-    const base64 = base64FromDataUrl(chosen.dataUrl);
-    if (!base64) {
-      return NextResponse.json(
-        { error: "Image must be a base64 image data URL." },
-        { status: 400 },
-      );
-    }
-    if (base64.length > 10_000_000) {
-      return NextResponse.json({ error: "Image is too large (over ~7MB)." }, { status: 413 });
-    }
-
-    let imageHash: string;
-    try {
-      imageHash = await uploadImage(account, token, base64);
-    } catch (err) {
-      const msg =
-        err instanceof MetaApiError
-          ? metaErrorToMessage(err)
-          : err instanceof Error
-            ? err.message
-            : "Image upload failed";
-      return NextResponse.json({ error: `Could not upload the image: ${msg}` }, { status: 502 });
-    }
-
-    // Video: confirm EVERY uploaded aspect slot finished processing BEFORE any store
-    // writes — a not-ready video would fail every creative with an opaque Meta error.
-    // (superRefine guarantees >= 1 slot with unique placements.) The thumbnail (imageHash
-    // above) is shared across all slots.
-    if (format === "video") {
-      for (const v of videos) {
-        try {
-          const status = await getVideoStatus(token, v.videoId);
-          if (status.status !== "ready") {
-            return NextResponse.json(
-              {
-                error:
-                  status.status === "error"
-                    ? `Meta could not process the ${ratioLabel(v.placement)} video — try uploading a different file.`
-                    : `The ${ratioLabel(v.placement)} video is still processing on Meta's side — try again in a moment.`,
-              },
-              { status: 409 },
-            );
-          }
-        } catch (err) {
-          const msg =
-            err instanceof MetaApiError
-              ? metaErrorToMessage(err)
-              : err instanceof Error
-                ? err.message
-                : "Video check failed";
+  // Duplicate mode uploads NOTHING here — each store's own source ad is resolved
+  // fresh, per campaign, inside the write loop below (findSourceAdCreative).
+  let content: CreativeContent | null = null;
+  if (mode === "create") {
+    if (format === "carousel") {
+      const cardsIn = cards ?? [];
+      const decoded: { base64: string; headline: string; description?: string; link?: string }[] =
+        [];
+      for (const [i, card] of cardsIn.entries()) {
+        if (card.link && !isHttpUrl(card.link)) {
           return NextResponse.json(
-            { error: `Could not verify the ${ratioLabel(v.placement)} video: ${msg}` },
-            { status: 502 },
+            { error: `Card ${i + 1}: the link is not a valid http(s) URL.` },
+            { status: 400 },
           );
         }
+        const b64 = base64FromDataUrl(card.dataUrl);
+        if (!b64) {
+          return NextResponse.json(
+            { error: `Card ${i + 1}: the image must be a base64 image data URL.` },
+            { status: 400 },
+          );
+        }
+        if (b64.length > 10_000_000) {
+          return NextResponse.json(
+            { error: `Card ${i + 1}: the image is too large (over ~7MB).` },
+            { status: 413 },
+          );
+        }
+        decoded.push({
+          base64: b64,
+          headline: card.headline,
+          description: card.description,
+          link: card.link,
+        });
       }
-      content = { kind: "video", videos, thumbnailHash: imageHash };
+      const cardSpecs: CarouselCardSpec[] = [];
+      try {
+        for (const d of decoded) {
+          cardSpecs.push({
+            imageHash: await uploadImage(account, token, d.base64),
+            headline: d.headline,
+            description: d.description,
+            link: d.link,
+          });
+        }
+      } catch (err) {
+        const msg =
+          err instanceof MetaApiError
+            ? metaErrorToMessage(err)
+            : err instanceof Error
+              ? err.message
+              : "Image upload failed";
+        return NextResponse.json(
+          { error: `Could not upload the image for card ${cardSpecs.length + 1}: ${msg}` },
+          { status: 502 },
+        );
+      }
+      content = { kind: "carousel", cards: cardSpecs };
     } else {
-      content = { kind: "image", imageHash };
+      // Pick one image (square preferred), decode it, and reject anything oversized.
+      // For video ads this image is the REQUIRED thumbnail.
+      const chosen = images.find((i) => i.placement === "square") ?? images[0]!;
+      const base64 = base64FromDataUrl(chosen.dataUrl);
+      if (!base64) {
+        return NextResponse.json(
+          { error: "Image must be a base64 image data URL." },
+          { status: 400 },
+        );
+      }
+      if (base64.length > 10_000_000) {
+        return NextResponse.json({ error: "Image is too large (over ~7MB)." }, { status: 413 });
+      }
+
+      let imageHash: string;
+      try {
+        imageHash = await uploadImage(account, token, base64);
+      } catch (err) {
+        const msg =
+          err instanceof MetaApiError
+            ? metaErrorToMessage(err)
+            : err instanceof Error
+              ? err.message
+              : "Image upload failed";
+        return NextResponse.json({ error: `Could not upload the image: ${msg}` }, { status: 502 });
+      }
+
+      // Video: confirm EVERY uploaded aspect slot finished processing BEFORE any store
+      // writes — a not-ready video would fail every creative with an opaque Meta error.
+      // (superRefine guarantees >= 1 slot with unique placements.) The thumbnail (imageHash
+      // above) is shared across all slots.
+      if (format === "video") {
+        for (const v of videos) {
+          try {
+            const status = await getVideoStatus(token, v.videoId);
+            if (status.status !== "ready") {
+              return NextResponse.json(
+                {
+                  error:
+                    status.status === "error"
+                      ? `Meta could not process the ${ratioLabel(v.placement)} video — try uploading a different file.`
+                      : `The ${ratioLabel(v.placement)} video is still processing on Meta's side — try again in a moment.`,
+                },
+                { status: 409 },
+              );
+            }
+          } catch (err) {
+            const msg =
+              err instanceof MetaApiError
+                ? metaErrorToMessage(err)
+                : err instanceof Error
+                  ? err.message
+                  : "Video check failed";
+            return NextResponse.json(
+              { error: `Could not verify the ${ratioLabel(v.placement)} video: ${msg}` },
+              { status: 502 },
+            );
+          }
+        }
+        content = { kind: "video", videos, thumbnailHash: imageHash };
+      } else {
+        content = { kind: "image", imageHash };
+      }
     }
   }
 
@@ -534,20 +573,15 @@ export async function POST(
         continue;
       }
       const adsetId = pick.id;
-      // This store's landing page wins over the modal's fallback URL. A mapped URL
-      // that isn't http(s) fails just this store, with a clear message, rather than
-      // silently sending its ad to the fallback.
+      // Per-store mapped landing page (mapping CSV `url` column) applies to BOTH
+      // modes identically — it wins over whatever fallback/inherited link would
+      // otherwise apply.
       const storeUrl = storeCode ? landingUrls.get(storeCode) ?? null : null;
-      const link = storeUrl ?? creative.link;
-      if (!isHttpUrl(link)) {
-        results.push({
-          campaignId, storeCode, campaignName, ok: false,
-          error: "This store's mapped landing URL is not a valid http(s) URL.",
-        });
-        continue;
-      }
+
       // Proactive pacing: when Meta's usage headers say we're near the wall, breathe
-      // between stores (inside the budget) instead of slamming into error 17.
+      // between stores (inside the budget) instead of slamming into error 17. Runs
+      // before ANY further per-campaign Graph calls — duplicate mode's source-ad
+      // lookup below included, not just the final write.
       const usage = getMetaUsage(account.id);
       if (usage && usage.utilizationPct >= PACE_AT) {
         const over = usage.utilizationPct - PACE_AT;
@@ -558,17 +592,67 @@ export async function POST(
         }
       }
 
+      let creativeParams: Record<string, unknown>;
+      if (mode === "duplicate") {
+        // Duplicate: the mapped landing page (if any) still applies; otherwise an
+        // operator-typed override; otherwise undefined — leave the source ad's own
+        // link untouched (the "auto-carry-over" contract).
+        const overrideLink = storeUrl ?? (creative.link.trim() || undefined);
+        if (overrideLink && !isHttpUrl(overrideLink)) {
+          results.push({
+            campaignId, storeCode, campaignName, ok: false,
+            error: "This store's mapped landing URL is not a valid http(s) URL.",
+          });
+          continue;
+        }
+        // Find THIS campaign's own ad named `adName` and read its creative fresh —
+        // account-scoped assets (image_hash/video_id) it references are already
+        // valid here, so nothing is re-uploaded.
+        const found = await findSourceAdCreative(token, campaignId, adName);
+        if (!found) {
+          results.push({
+            campaignId, storeCode, campaignName, ok: false,
+            error: `No ad named "${adName}" found in this campaign.`,
+          });
+          continue;
+        }
+        creativeParams = buildDuplicateCreativeParams({
+          pageId,
+          instagramUserId: row?.instagramUserId ?? null,
+          source: found,
+          overrides: {
+            adName,
+            primaryText: creative.primaryText.trim() || undefined,
+            headline: creative.headline.trim() || undefined,
+            subheadline: creative.subheadline.trim() || undefined,
+            link: overrideLink,
+            cta: creative.cta,
+          },
+        });
+      } else {
+        // Create: this store's landing page wins over the modal's fallback URL. A
+        // mapped URL that isn't http(s) fails just this store, with a clear message,
+        // rather than silently sending its ad to the fallback.
+        const link = storeUrl ?? creative.link;
+        if (!isHttpUrl(link)) {
+          results.push({
+            campaignId, storeCode, campaignName, ok: false,
+            error: "This store's mapped landing URL is not a valid http(s) URL.",
+          });
+          continue;
+        }
+        creativeParams = buildCreativeParams({
+          pageId,
+          instagramUserId: row?.instagramUserId ?? null,
+          content: content!,
+          creative: { adName, ...creative, link },
+        });
+      }
+
       // One batched round trip per store: creative + PAUSED ad as dependent Graph
       // batch ops (both still count individually toward rate limits).
       const writeOne = (): Promise<string> =>
-        createCreativeAndPausedAd(account, token, {
-          pageId,
-          instagramUserId: row?.instagramUserId ?? null,
-          content,
-          creative: { adName, ...creative, link },
-          adsetId,
-          pixelId,
-        });
+        createCreativeAndPausedAd(account, token, { adName, creativeParams, adsetId, pixelId });
 
       let adId: string;
       try {

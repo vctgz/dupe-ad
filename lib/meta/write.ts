@@ -1,11 +1,18 @@
 // Meta Graph WRITE path — SERVER ONLY.
 //
 // Creates fresh, PAGE-BOUND ads, one per store, all PAUSED (docs/01-meta-api-facts
-// #1, #3, #7). The cross-page fan-out is N brand-new creatives — one per store's
-// Page — built from the SAME uploaded image_hash / video_id (account-scoped,
-// uploaded once, #5). This is the from-scratch "Create new" engine; live
-// duplicate-mode cloning is a deliberate follow-up, and multi-placement
-// asset_feed_spec for STATIC IMAGES is still a follow-up (video already ships it).
+// #1, #3, #7). Two engines share this module:
+//   Create    — N brand-new creatives, one per store's Page, built from the SAME
+//               freshly-uploaded image_hash / video_id (account-scoped, uploaded
+//               once, #5).
+//   Duplicate — clones an EXISTING ad (found by exact name within each selected
+//               campaign) onto that same store's Page: its own account-scoped
+//               assets are reused as-is (nothing re-uploaded), and only the
+//               copy/link/CTA fields the operator explicitly overrides change —
+//               a multi-aspect asset_feed_spec carries every ratio over unchanged.
+// Multi-placement asset_feed_spec for STATIC IMAGES (Create mode) is still a
+// follow-up (video already ships it; Duplicate mode carries over whatever the
+// source ad already has, image or video).
 //
 // Nothing here is auto-run: the API route invokes it only on an explicit, confirmed
 // user action, and every ad is created PAUSED for per-ad review.
@@ -13,7 +20,7 @@ import "server-only";
 import { MetaApiError, get, getObject, post, postBatch } from "@/lib/meta/client";
 import { kvGet, kvSet } from "@/lib/kv";
 import type { AdAccount } from "@/config/accounts";
-import { buildCreativeParams, type CreativeContent, type CreativeInput } from "@/lib/meta/creative-spec";
+import type { DuplicateSourceCreative } from "@/lib/meta/creative-spec";
 
 // Creative-shape builders + their types live in the pure (server-only-free) module so
 // they can be unit-tested in isolation. Re-exported here so existing importers keep
@@ -21,6 +28,7 @@ import { buildCreativeParams, type CreativeContent, type CreativeInput } from "@
 export {
   buildCreativeParams,
   buildVideoAssetRules,
+  buildDuplicateCreativeParams,
 } from "@/lib/meta/creative-spec";
 export type {
   CreativeInput,
@@ -29,6 +37,8 @@ export type {
   VideoPlacement,
   VideoPlacementKey,
   VideoAssetRule,
+  DuplicateSourceCreative,
+  DuplicateOverrides,
 } from "@/lib/meta/creative-spec";
 
 /** Strip a `data:image/...;base64,` prefix, returning the bare base64 payload. */
@@ -186,28 +196,70 @@ export function pickAdsetFromList(adsets: MetaAdset[], adsetName?: string): Adse
   return { id: chosen.id, name: chosen.name ?? "" };
 }
 
+// Page sizes for a per-campaign, name-filtered /ads pull, largest first. Mirrors
+// discovery's account-level Template pull (lib/meta/discovery.ts): a server-side
+// CONTAIN filter keeps the pull small even on campaigns with a long paused-ad
+// history, and we back off on Meta error #1 before giving up.
+const SOURCE_AD_PAGE_SIZES = [50, 20, 5] as const;
+
+interface MetaSourceAd {
+  id: string;
+  name?: string;
+  effective_status?: string;
+  creative?: {
+    object_story_spec?: Record<string, unknown>;
+    asset_feed_spec?: Record<string, unknown>;
+  };
+}
+
 /**
- * Create a page-bound creative (image/carousel link_data, single-video video_data, or
- * a multi-aspect video asset_feed_spec) and return its id. The page binding is
- * immutable once set — this is a NEW creative for THIS store's Page (#1).
+ * Find the ad named `adName` (case-insensitive EXACT match — matching the modal's
+ * "exact ad name" contract; ACTIVE preferred among ties) within ONE campaign, and
+ * return its full creative shape for DUPLICATE mode. The destination ad reuses
+ * these account-scoped asset references (image_hash / video_id) directly — nothing
+ * is re-uploaded. Returns null when no ad in this campaign matches.
  */
-export async function createCreative(
-  account: AdAccount,
+export async function findSourceAdCreative(
   token: string,
-  args: {
-    pageId: string;
-    instagramUserId?: string | null;
-    content: CreativeContent;
-    creative: CreativeInput;
-  },
-): Promise<string> {
-  const res = await post<{ id?: string }>(
-    `act_${account.id}/adcreatives`,
-    buildCreativeParams(args),
-    token,
-  );
-  if (!res.id) throw new Error("Creative creation did not return an id.");
-  return res.id;
+  campaignId: string,
+  adName: string,
+): Promise<DuplicateSourceCreative | null> {
+  const filtering = JSON.stringify([{ field: "name", operator: "CONTAIN", value: adName }]);
+  let ads: MetaSourceAd[] | null = null;
+  let lastErr: unknown;
+  for (const limit of SOURCE_AD_PAGE_SIZES) {
+    try {
+      ads = await get<MetaSourceAd>(
+        `${campaignId}/ads`,
+        {
+          fields: "id,name,effective_status,creative{object_story_spec,asset_feed_spec}",
+          limit,
+          filtering,
+        },
+        token,
+      );
+      break;
+    } catch (err) {
+      if (err instanceof MetaApiError && err.code === 1) {
+        lastErr = err;
+        // eslint-disable-next-line no-console
+        console.warn(`[meta] ${campaignId}/ads too large at limit=${limit}; backing off`);
+        continue;
+      }
+      throw err;
+    }
+  }
+  if (ads === null) throw lastErr;
+
+  const target = adName.trim().toLowerCase();
+  const matches = ads.filter((a) => (a.name ?? "").trim().toLowerCase() === target);
+  if (matches.length === 0) return null;
+  const chosen =
+    matches.find((a) => (a.effective_status ?? "").toUpperCase() === "ACTIVE") ?? matches[0]!;
+  return {
+    objectStorySpec: chosen.creative?.object_story_spec ?? null,
+    assetFeedSpec: chosen.creative?.asset_feed_spec ?? null,
+  };
 }
 
 interface MetaPixel {
@@ -258,53 +310,28 @@ export async function resolveTrackingPixelId(
 }
 
 /**
- * Create a PAUSED ad from a creative; returns the ad id (#7 — always PAUSED). When a
- * `pixelId` is supplied, the ad tracks website events against it (so the "Website events"
- * box in the ad's Tracking section is checked); Meta auto-adds the rest of the tracking
- * specs (onsite/page engagement).
- */
-export async function createPausedAd(
-  account: AdAccount,
-  token: string,
-  args: { adsetId: string; creativeId: string; name: string; pixelId?: string | null },
-): Promise<string> {
-  const params: Record<string, unknown> = {
-    name: args.name,
-    adset_id: args.adsetId,
-    creative: { creative_id: args.creativeId },
-    status: "PAUSED",
-  };
-  if (args.pixelId) {
-    params.tracking_specs = [
-      { "action.type": ["offsite_conversion"], fb_pixel: [args.pixelId] },
-    ];
-  }
-  const res = await post<{ id?: string }>(`act_${account.id}/ads`, params, token);
-  if (!res.id) throw new Error("Ad creation did not return an id.");
-  return res.id;
-}
-
-/**
  * Create a store's creative AND its PAUSED ad in ONE batched HTTP round trip: two
  * dependent Graph batch ops, with the ad referencing the creative via Meta's
- * documented JSONPath form ({result=creative:$.id}). Same semantics and safety as
- * createCreative() + createPausedAd() — half the per-store latency. Both operations
- * still count toward rate limits individually.
+ * documented JSONPath form ({result=creative:$.id}) — half the per-store latency of
+ * two separate calls. Both operations still count toward rate limits individually.
+ *
+ * Mode-agnostic by design: the caller builds `creativeParams` itself, via
+ * buildCreativeParams() for Create (fresh media) or buildDuplicateCreativeParams()
+ * for Duplicate (cloned from an existing ad) — this function only needs the final
+ * params object plus the ad-level fields (name, ad set, pixel).
  */
 export async function createCreativeAndPausedAd(
   account: AdAccount,
   token: string,
   args: {
-    pageId: string;
-    instagramUserId?: string | null;
-    content: CreativeContent;
-    creative: CreativeInput;
+    adName: string;
+    creativeParams: Record<string, unknown>;
     adsetId: string;
     pixelId?: string | null;
   },
 ): Promise<string> {
   const adParams: Record<string, unknown> = {
-    name: args.creative.adName,
+    name: args.adName,
     adset_id: args.adsetId,
     creative: { creative_id: "{result=creative:$.id}" },
     status: "PAUSED",
@@ -320,7 +347,7 @@ export async function createCreativeAndPausedAd(
         method: "POST",
         name: "creative",
         relativeUrl: `act_${account.id}/adcreatives`,
-        params: buildCreativeParams(args),
+        params: args.creativeParams,
       },
       { method: "POST", relativeUrl: `act_${account.id}/ads`, params: adParams },
     ],

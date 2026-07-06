@@ -177,8 +177,8 @@ function buildVideoAssetFeedSpec(
 
 /**
  * Build the full `POST act_<id>/adcreatives` params for a creative — `{ name,
- * object_story_spec, asset_feed_spec? }`. Exported for the create route's batch path;
- * most callers want createCreative().
+ * object_story_spec, asset_feed_spec? }`. Used by the Create flow (fresh media);
+ * Duplicate mode uses buildDuplicateCreativeParams() below instead.
  *
  *   image         — link_data: `link` mirrored into call_to_action.value.link (#4).
  *   video (1)     — video_data: NO top-level link field exists; the destination lives
@@ -277,4 +277,119 @@ export function buildCreativeParams(args: {
   }
   objectStorySpec.link_data = linkData;
   return { name, object_story_spec: objectStorySpec };
+}
+
+// ── Duplicate mode: clone an EXISTING ad's creative onto another store ──────────
+//
+// Unlike Create (fresh media, freshly built params), Duplicate starts from a source
+// ad already living in this same account — its image_hash(es)/video_id(s) are
+// already valid here, so nothing is re-uploaded. We deep-clone its own creative
+// shape and patch only what the operator explicitly overrides; a multi-aspect
+// `asset_feed_spec` (e.g. our own 1-3 ratio video ads) carries its assets +
+// placement rules over UNCHANGED, so an already-serving multi-ratio ad keeps
+// serving every ratio per placement when cloned onto another store's Page.
+
+/** Deep-clone a plain JSON-shaped value (Graph API responses are always JSON-safe). */
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+/** A source ad's creative, as read fresh from Meta for DUPLICATE mode. */
+export interface DuplicateSourceCreative {
+  objectStorySpec: Record<string, unknown> | null;
+  assetFeedSpec: Record<string, unknown> | null;
+}
+
+/**
+ * What the operator may override when duplicating an ad. Every field besides
+ * `adName` is OPTIONAL — undefined/blank means "keep the source ad's own value".
+ * This is the "auto-carry-over" contract: duplicate clones an already-valid
+ * creative (any format) and only touches what's explicitly typed.
+ */
+export interface DuplicateOverrides {
+  adName: string;
+  primaryText?: string;
+  headline?: string;
+  subheadline?: string;
+  link?: string;
+  cta?: string;
+}
+
+/**
+ * Build fresh `POST .../adcreatives` params for DUPLICATE mode. Starts from a deep
+ * clone of the SOURCE ad's own creative, rebinds the page/IG identity to the
+ * DESTINATION store's own (freshly resolved — never trusted from the old creative,
+ * in case the store's page changed since), and patches in only the copy/link/CTA
+ * fields the operator explicitly overrode.
+ */
+export function buildDuplicateCreativeParams(args: {
+  pageId: string;
+  instagramUserId?: string | null;
+  source: DuplicateSourceCreative;
+  overrides: DuplicateOverrides;
+}): Record<string, unknown> {
+  const { pageId, instagramUserId, source, overrides } = args;
+  const name = `${overrides.adName} — creative`;
+
+  if (!source.objectStorySpec && !source.assetFeedSpec) {
+    throw new Error("The source ad has no readable creative to duplicate.");
+  }
+
+  // Multi-aspect source (today: our own 1-3 ratio video ads) — reuse the labeled
+  // asset array + placement rules VERBATIM (account-scoped ids are already valid
+  // here); only the copy/link/CTA arrays get rewritten.
+  if (source.assetFeedSpec) {
+    const afs = cloneJson(source.assetFeedSpec);
+    if (overrides.primaryText) afs.bodies = [{ text: overrides.primaryText }];
+    if (overrides.headline) afs.titles = [{ text: overrides.headline }];
+    if (overrides.subheadline) afs.descriptions = [{ text: overrides.subheadline }];
+    if (overrides.link) afs.link_urls = [{ website_url: overrides.link }];
+    if (overrides.cta) afs.call_to_action_types = [overrides.cta];
+    const identity: Record<string, unknown> = { page_id: pageId };
+    if (instagramUserId) identity.instagram_user_id = instagramUserId;
+    return { name, object_story_spec: identity, asset_feed_spec: afs };
+  }
+
+  const oss = cloneJson(source.objectStorySpec!);
+  // Rebind identity fresh — never trust the (possibly stale) source creative's own.
+  oss.page_id = pageId;
+  if (instagramUserId) oss.instagram_user_id = instagramUserId;
+  else delete oss.instagram_user_id;
+
+  if (oss.video_data) {
+    const vd = oss.video_data as Record<string, unknown>;
+    if (overrides.headline) vd.title = overrides.headline;
+    if (overrides.primaryText) vd.message = overrides.primaryText;
+    if (overrides.subheadline) vd.link_description = overrides.subheadline;
+    if (overrides.link || overrides.cta) {
+      const prevCta = (vd.call_to_action as Record<string, unknown>) ?? {};
+      const prevValue = (prevCta.value as Record<string, unknown>) ?? {};
+      vd.call_to_action = {
+        type: overrides.cta ?? prevCta.type,
+        value: { ...prevValue, link: overrides.link ?? prevValue.link },
+      };
+    }
+  } else if (oss.link_data) {
+    const ld = oss.link_data as Record<string, unknown>;
+    if (overrides.primaryText) ld.message = overrides.primaryText;
+    // Carousel cards carry their own name/description/link/CTA — leave them alone;
+    // duplicate mode has no per-card override UI. Single-image name/description map
+    // to headline/subheadline.
+    if (!ld.child_attachments) {
+      if (overrides.headline) ld.name = overrides.headline;
+      if (overrides.subheadline) ld.description = overrides.subheadline;
+    }
+    if (overrides.link) {
+      ld.link = overrides.link;
+      if (ld.call_to_action) {
+        const cta = ld.call_to_action as Record<string, unknown>;
+        cta.value = { ...(cta.value as Record<string, unknown>), link: overrides.link };
+      }
+    }
+    if (overrides.cta) {
+      ld.call_to_action = { type: overrides.cta, value: { link: overrides.link ?? (ld.link as string) } };
+    }
+  }
+
+  return { name, object_story_spec: oss };
 }
