@@ -72,6 +72,36 @@ const PLACEMENTS: Placement[] = [
 
 const ASPECT_TOLERANCE = 0.03; // ±~3%
 
+// The three video aspect slots. Distinct from PLACEMENTS: link images want a 1.91:1
+// horizontal, but VIDEO wants a true 16:9, and vertical video accepts 9:16 or 4:5.
+// Each slot uploads independently; 2+ serve per placement via asset_feed_spec, 1 keeps
+// the single-video creative.
+interface VideoSlot {
+  key: "square" | "vertical" | "horizontal";
+  label: string;
+  spec: string;
+  ratios: { ratio: number; name: string }[];
+}
+
+const VIDEO_SLOTS: VideoSlot[] = [
+  { key: "square", label: "Square 1:1", spec: "1080 × 1080", ratios: [{ ratio: 1, name: "1:1" }] },
+  {
+    key: "vertical",
+    label: "Vertical 9:16",
+    spec: "1080 × 1920",
+    ratios: [
+      { ratio: 9 / 16, name: "9:16" },
+      { ratio: 4 / 5, name: "4:5" },
+    ],
+  },
+  {
+    key: "horizontal",
+    label: "Horizontal 16:9",
+    spec: "1920 × 1080",
+    ratios: [{ ratio: 16 / 9, name: "16:9" }],
+  },
+];
+
 // Full Meta call-to-action set. NO_BUTTON is the "no CTA" choice; the rest map
 // 1:1 to Meta's call_to_action_type enum. Labels are the human-readable form.
 const CTA_OPTIONS: { value: string; label: string }[] = [
@@ -159,6 +189,12 @@ interface VideoState {
   /** The uploaded Blob URL (kept so it can be deleted once Meta is done with it). */
   blobUrl: string | null;
   error: string | null;
+  // Aspect-ratio check (advisory, like images) — null until the metadata probe lands.
+  width: number | null;
+  height: number | null;
+  ratio: number | null;
+  ok: boolean | null;
+  matchedName: string | null;
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -387,11 +423,13 @@ function videoStatusLine(v: VideoState): { text: string; tone: "ok" | "busy" | "
 }
 
 function VideoDropzone({
+  slot,
   video,
   onPick,
   onClear,
 }: {
-  video: VideoState | null;
+  slot: VideoSlot;
+  video: VideoState | undefined;
   onPick: (file: File) => void;
   onClear: () => void;
 }) {
@@ -403,14 +441,27 @@ function VideoDropzone({
     if (file && file.type.startsWith("video/")) onPick(file);
   };
 
+  // Each slot previews at its own target aspect so the three are distinguishable.
+  const aspectClass =
+    slot.key === "vertical"
+      ? "aspect-[9/16]"
+      : slot.key === "horizontal"
+        ? "aspect-video"
+        : "aspect-square";
+
   const status = video ? videoStatusLine(video) : null;
+  // Advisory ratio badge — shown once the metadata probe has run (ok !== null).
+  const showRatio = video && video.ok !== null;
 
   return (
     <div className="flex flex-col gap-1.5">
       <div className="flex items-baseline justify-between gap-2">
-        <span className="whitespace-nowrap text-fas-12 font-medium text-ink">Video</span>
-        <span className="min-w-0 truncate font-mono text-fas-11 text-ink-muted">
-          MP4 / MOV · up to {MAX_VIDEO_MB}MB
+        <span className="whitespace-nowrap text-fas-12 font-medium text-ink">{slot.label}</span>
+        <span
+          className="min-w-0 truncate font-mono text-fas-11 text-ink-muted"
+          title={`${slot.spec} · MP4 / MOV · up to ${MAX_VIDEO_MB}MB`}
+        >
+          {slot.spec}
         </span>
       </div>
       <div
@@ -425,7 +476,8 @@ function VideoDropzone({
           handleFiles(e.dataTransfer.files);
         }}
         className={[
-          "relative flex aspect-video w-full items-center justify-center overflow-hidden rounded-fas-md border border-dashed transition-colors",
+          "relative flex w-full items-center justify-center overflow-hidden rounded-fas-md border border-dashed transition-colors",
+          aspectClass,
           dragOver
             ? "border-accent bg-accent-tint"
             : "border-hairline-strong bg-surface-sunken hover:border-accent/60 hover:bg-accent-tint/40",
@@ -438,7 +490,7 @@ function VideoDropzone({
             <button
               type="button"
               onClick={onClear}
-              aria-label="Remove video"
+              aria-label={`Remove ${slot.label} video`}
               className="fas-focus absolute right-1.5 top-1.5 inline-flex h-6 w-6 items-center justify-center rounded-fas-sm bg-surface/90 text-ink-muted shadow-fas-card hover:text-ink"
             >
               <Trash2 size={13} strokeWidth={2} aria-hidden="true" />
@@ -451,7 +503,7 @@ function VideoDropzone({
             className="fas-focus flex h-full w-full flex-col items-center justify-center gap-1.5 px-2 text-center text-ink-muted hover:text-ink"
           >
             <Film size={20} strokeWidth={1.75} aria-hidden="true" />
-            <span className="text-fas-11">Drop or choose a video</span>
+            <span className="text-fas-11">Drop or choose</span>
           </button>
         )}
         <input
@@ -460,7 +512,7 @@ function VideoDropzone({
           accept="video/*"
           className="sr-only"
           onChange={(e) => handleFiles(e.target.files)}
-          aria-label="Ad video"
+          aria-label={`${slot.label} video`}
         />
       </div>
       {status ? (
@@ -487,6 +539,22 @@ function VideoDropzone({
       ) : (
         <span className="text-fas-11 text-ink-muted">No video yet</span>
       )}
+      {showRatio ? (
+        video!.ok ? (
+          <span className="inline-flex items-center gap-1 text-fas-11 text-status-ok">
+            <CheckCircle2 size={12} strokeWidth={2} aria-hidden="true" />
+            {video!.matchedName} · {video!.width}×{video!.height}
+          </span>
+        ) : (
+          <span className="inline-flex items-start gap-1 text-fas-11 text-status-mismatch" role="alert">
+            <TriangleAlert size={12} strokeWidth={2} aria-hidden="true" className="mt-px shrink-0" />
+            <span>
+              {video!.width}×{video!.height} — off the {slot.ratios.map((r) => r.name).join(" / ")}{" "}
+              ratio. It may be cropped.
+            </span>
+          </span>
+        )
+      ) : null}
     </div>
   );
 }
@@ -817,9 +885,11 @@ export default function DuplicateModal({
 
   // Ad format (create mode): static image vs video vs carousel.
   const [format, setFormat] = useState<AdFormat>("single");
-  const [video, setVideo] = useState<VideoState | null>(null);
-  // Generation counter so a cleared/replaced video cancels its in-flight pipeline.
-  const videoGenRef = useRef(0);
+  // One video per aspect slot (same shape as `images`). Each uploads independently.
+  const [videos, setVideos] = useState<Partial<Record<VideoSlot["key"], VideoState>>>({});
+  // Per-slot generation counter so a cleared/replaced video cancels ONLY its own
+  // in-flight pipeline, leaving sibling slots' uploads running.
+  const videoGenRef = useRef<Record<string, number>>({ square: 0, vertical: 0, horizontal: 0 });
   // Carousel cards, in display order.
   const [cards, setCards] = useState<CardState[]>([emptyCard(1), emptyCard(2)]);
   const nextCardId = useRef(3);
@@ -856,7 +926,18 @@ export default function DuplicateModal({
   const adNameOk = adName.trim().length > 0;
   const isVideo = isCreate && format === "video";
   const isCarousel = isCreate && format === "carousel";
-  const videoReady = video?.phase === "ready" && !!video.videoId;
+  const videoList = useMemo(
+    () => Object.values(videos).filter((v): v is VideoState => !!v),
+    [videos],
+  );
+  // At least one slot fully processed, and NONE mid-pipeline — never fire a create that
+  // silently drops a slot the operator is still waiting on. A slot in `error` doesn't
+  // block (it just won't count); an empty slot is fine.
+  const anyVideoReady = videoList.some((v) => v.phase === "ready" && !!v.videoId);
+  const anyVideoBusy = videoList.some(
+    (v) => v.phase === "uploading" || v.phase === "registering" || v.phase === "processing",
+  );
+  const videoReady = anyVideoReady && !anyVideoBusy;
   const hasThumb = !!images.square;
   // Every card needs its square image + a headline; the shared headline/subheadline
   // fields don't apply (each card carries its own).
@@ -956,11 +1037,14 @@ export default function DuplicateModal({
     });
   }, []);
 
-  const clearVideo = useCallback(() => {
-    videoGenRef.current += 1; // cancels any in-flight upload/poll chain
-    setVideo((prev) => {
-      if (prev) URL.revokeObjectURL(prev.url);
-      return null;
+  const clearVideo = useCallback((key: VideoSlot["key"]) => {
+    videoGenRef.current[key] = (videoGenRef.current[key] ?? 0) + 1; // cancel this slot's chain
+    setVideos((prev) => {
+      const old = prev[key];
+      if (old) URL.revokeObjectURL(old.url);
+      const next = { ...prev };
+      delete next[key];
+      return next;
     });
   }, []);
 
@@ -1041,63 +1125,94 @@ export default function DuplicateModal({
     };
   }, []);
 
-  // Revoke the video object URL + cancel polling on unmount.
+  // Revoke every slot's video object URL + cancel all polling on unmount.
+  const videosRef = useRef(videos);
+  videosRef.current = videos;
   useEffect(() => {
+    const gens = videoGenRef.current; // stable ref object; capture for cleanup
     return () => {
-      videoGenRef.current += 1;
-      setVideo((prev) => {
-        if (prev) URL.revokeObjectURL(prev.url);
-        return null;
+      for (const key of Object.keys(gens)) gens[key] = (gens[key] ?? 0) + 1;
+      Object.values(videosRef.current).forEach((v) => {
+        if (v) URL.revokeObjectURL(v.url);
       });
     };
   }, []);
 
   /**
-   * The full video pipeline, kicked off at pick time so the operator fills in copy
-   * while Meta processes: browser -> Blob (direct client upload), Blob URL ->
-   * /api/video (Meta pulls it), then poll /api/video until ready. A bumped
-   * generation (clear/replace/close) abandons the chain at the next checkpoint.
+   * The full per-slot video pipeline, kicked off at pick time so the operator fills in
+   * copy while Meta processes: browser -> Blob (direct client upload), Blob URL ->
+   * /api/video (Meta pulls it), then poll /api/video until ready. Each aspect slot runs
+   * its own chain keyed by `slot`; a bumped per-slot generation (clear/replace/close)
+   * abandons only that slot's chain at the next checkpoint.
    */
   const pickVideo = useCallback(
-    (file: File) => {
-      videoGenRef.current += 1;
-      const gen = videoGenRef.current;
+    (slot: VideoSlot, file: File) => {
+      const key = slot.key;
+      videoGenRef.current[key] = (videoGenRef.current[key] ?? 0) + 1;
+      const gen = videoGenRef.current[key];
       const url = URL.createObjectURL(file);
       const sizeMB = file.size / (1024 * 1024);
+      // Update this slot only when its generation is still current.
+      const patch = (fn: (v: VideoState) => VideoState) =>
+        setVideos((prev) => {
+          const cur = prev[key];
+          if (!cur || videoGenRef.current[key] !== gen) return prev;
+          return { ...prev, [key]: fn(cur) };
+        });
 
-      setVideo((prev) => {
-        if (prev) URL.revokeObjectURL(prev.url);
+      setVideos((prev) => {
+        const old = prev[key];
+        if (old) URL.revokeObjectURL(old.url);
         return {
-          file,
-          fileName: file.name,
-          url,
-          sizeMB,
-          duration: null,
-          phase: "uploading",
-          uploadPct: 0,
-          processingPct: null,
-          videoId: null,
-          blobUrl: null,
-          error: null,
+          ...prev,
+          [key]: {
+            file,
+            fileName: file.name,
+            url,
+            sizeMB,
+            duration: null,
+            phase: "uploading",
+            uploadPct: 0,
+            processingPct: null,
+            videoId: null,
+            blobUrl: null,
+            error: null,
+            width: null,
+            height: null,
+            ratio: null,
+            ok: null,
+            matchedName: null,
+          },
         };
       });
 
       if (sizeMB > MAX_VIDEO_MB) {
-        setVideo((v) =>
-          v && videoGenRef.current === gen
-            ? { ...v, phase: "error", error: `Video is ${sizeMB.toFixed(0)}MB — the limit is ${MAX_VIDEO_MB}MB.` }
-            : v,
-        );
+        patch((v) => ({
+          ...v,
+          phase: "error",
+          error: `Video is ${sizeMB.toFixed(0)}MB — the limit is ${MAX_VIDEO_MB}MB.`,
+        }));
         return;
       }
 
-      // Duration probe (informational only).
+      // Metadata probe: duration (informational) + dimensions for the advisory ratio check.
       const probe = document.createElement("video");
       probe.preload = "metadata";
       probe.onloadedmetadata = () => {
-        if (videoGenRef.current === gen) {
-          setVideo((v) => (v ? { ...v, duration: probe.duration } : v));
-        }
+        const width = probe.videoWidth;
+        const height = probe.videoHeight;
+        const ratio = height > 0 ? width / height : null;
+        const { ok, matchedName } =
+          ratio != null ? validateRatio(ratio, slot.ratios) : { ok: false, matchedName: null };
+        patch((v) => ({
+          ...v,
+          duration: probe.duration,
+          width,
+          height,
+          ratio,
+          ok: ratio != null ? ok : null,
+          matchedName,
+        }));
       };
       probe.src = url;
 
@@ -1108,19 +1223,17 @@ export default function DuplicateModal({
             handleUploadUrl: "/api/blob-upload",
             clientPayload: JSON.stringify({ accountSlug }),
             onUploadProgress: ({ percentage }) => {
-              if (videoGenRef.current === gen) {
-                setVideo((v) => (v ? { ...v, uploadPct: percentage } : v));
-              }
+              patch((v) => ({ ...v, uploadPct: percentage }));
             },
           });
           const blobUrl = blob.url;
           // Cleared/replaced mid-upload: Meta was never handed this URL, so the object
           // is a pure orphan — safe to delete right away.
-          if (videoGenRef.current !== gen) {
+          if (videoGenRef.current[key] !== gen) {
             cleanupVideoBlob(accountSlug, blobUrl);
             return;
           }
-          setVideo((v) => (v ? { ...v, phase: "registering", blobUrl } : v));
+          patch((v) => ({ ...v, phase: "registering", blobUrl }));
 
           const res = await fetch("/api/video", {
             method: "POST",
@@ -1134,13 +1247,13 @@ export default function DuplicateModal({
           if (!res.ok || !body.videoId) {
             throw new Error(body.error ?? `Video registration failed (HTTP ${res.status})`);
           }
-          if (videoGenRef.current !== gen) return;
+          if (videoGenRef.current[key] !== gen) return;
           const videoId = body.videoId;
-          setVideo((v) => (v ? { ...v, phase: "processing", videoId } : v));
+          patch((v) => ({ ...v, phase: "processing", videoId }));
 
           for (;;) {
             await sleep(3_000);
-            if (videoGenRef.current !== gen) return;
+            if (videoGenRef.current[key] !== gen) return;
             const sres = await fetch(
               `/api/video?account=${encodeURIComponent(accountSlug)}&videoId=${encodeURIComponent(videoId)}`,
             );
@@ -1150,9 +1263,9 @@ export default function DuplicateModal({
               error?: string;
             };
             if (!sres.ok) throw new Error(sbody.error ?? "Video status check failed");
-            if (videoGenRef.current !== gen) return;
+            if (videoGenRef.current[key] !== gen) return;
             if (sbody.status === "ready") {
-              setVideo((v) => (v ? { ...v, phase: "ready", processingPct: 100 } : v));
+              patch((v) => ({ ...v, phase: "ready", processingPct: 100 }));
               // Meta has the processed copy now — the Blob upload is no longer needed.
               cleanupVideoBlob(accountSlug, blobUrl);
               return;
@@ -1163,21 +1276,15 @@ export default function DuplicateModal({
               cleanupVideoBlob(accountSlug, blobUrl);
               throw new Error("Meta could not process this video — try a different file.");
             }
-            setVideo((v) =>
-              v ? { ...v, processingPct: sbody.progress ?? v.processingPct } : v,
-            );
+            patch((v) => ({ ...v, processingPct: sbody.progress ?? v.processingPct }));
           }
         } catch (err) {
-          if (videoGenRef.current !== gen) return;
-          setVideo((v) =>
-            v
-              ? {
-                  ...v,
-                  phase: "error",
-                  error: err instanceof Error ? err.message : "Video upload failed",
-                }
-              : v,
-          );
+          if (videoGenRef.current[key] !== gen) return;
+          patch((v) => ({
+            ...v,
+            phase: "error",
+            error: err instanceof Error ? err.message : "Video upload failed",
+          }));
         }
       })();
     },
@@ -1307,11 +1414,21 @@ export default function DuplicateModal({
             })),
           )
         : undefined;
+      // One entry per uploaded, ready slot (in canonical slot order). 2+ serve per
+      // placement; a single slot keeps the proven single-video creative.
+      const videoPayload = isVideo
+        ? VIDEO_SLOTS.flatMap((s) => {
+            const v = videos[s.key];
+            return v?.phase === "ready" && v.videoId
+              ? [{ placement: s.key, videoId: v.videoId }]
+              : [];
+          })
+        : undefined;
       const payloadBase = {
         accountSlug,
         mode,
         format: isVideo ? "video" : isCarousel ? "carousel" : "single",
-        videoId: isVideo ? video?.videoId ?? undefined : undefined,
+        videos: videoPayload,
         cards: cardPayload,
         adName: adName.trim(),
         adsetName: adsetName.trim() || undefined,
@@ -1508,17 +1625,29 @@ export default function DuplicateModal({
               {isCreate ? <span className="ml-0.5 text-accent" aria-hidden="true">*</span> : null}
             </span>
             {isVideo ? (
-              <div className="grid grid-cols-1 items-start gap-4 sm:grid-cols-3">
-                <div className="sm:col-span-2">
-                  <VideoDropzone video={video} onPick={pickVideo} onClear={clearVideo} />
+              <>
+                <div className="grid grid-cols-1 items-start gap-4 sm:grid-cols-4">
+                  {VIDEO_SLOTS.map((s) => (
+                    <VideoDropzone
+                      key={s.key}
+                      slot={s}
+                      video={videos[s.key]}
+                      onPick={(file) => pickVideo(s, file)}
+                      onClear={() => clearVideo(s.key)}
+                    />
+                  ))}
+                  <Dropzone
+                    placement={{ ...PLACEMENTS[0]!, label: "Thumbnail 1:1" }}
+                    image={images.square}
+                    onPick={(file) => pickImage(PLACEMENTS[0]!, file)}
+                    onClear={() => clearImage("square")}
+                  />
                 </div>
-                <Dropzone
-                  placement={{ ...PLACEMENTS[0]!, label: "Thumbnail 1:1" }}
-                  image={images.square}
-                  onPick={(file) => pickImage(PLACEMENTS[0]!, file)}
-                  onClear={() => clearImage("square")}
-                />
-              </div>
+                <p className="text-fas-11 text-ink-muted">
+                  Upload up to three ratios — each placement (feed, Stories/Reels, in-stream)
+                  serves its matching video. One is enough to start; the thumbnail is required.
+                </p>
+              </>
             ) : isCarousel ? (
               <div className="flex flex-col gap-3">
                 {cards.map((card, i) => (
@@ -1833,9 +1962,9 @@ export default function DuplicateModal({
                     ? "Add a Meta write token (META_SYSTEM_USER_TOKEN) to enable live creation."
                     : !createReady
                       ? isVideo
-                        ? video && video.phase !== "ready" && video.phase !== "error"
-                          ? "Wait for the video to finish processing."
-                          : "Fill every required field, plus a video and a square thumbnail."
+                        ? anyVideoBusy
+                          ? "Wait for the video(s) to finish processing."
+                          : "Fill every required field, plus at least one video and a square thumbnail."
                         : isCarousel
                           ? "Every card needs a square image and a headline (2 cards minimum)."
                           : "Fill every required field (and add an image) first."

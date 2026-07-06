@@ -12,8 +12,9 @@
 //   - results are PER-STORE — one store failing never blocks the rest, and we never
 //     claim blanket success.
 //
-// Scope: the from-scratch "Create new" flow with a single page-bound image creative.
-// Live duplicate-mode cloning + multi-placement asset_feed_spec are follow-ups.
+// Scope: the from-scratch "Create new" flow (static image, video, or carousel).
+// Video ships per-placement asset_feed_spec (1-3 aspect ratios); the same multi-aspect
+// treatment for STATIC IMAGES and live duplicate-mode cloning remain follow-ups.
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { getAccountBySlug } from "@/config/accounts";
@@ -38,6 +39,7 @@ import {
   uploadImage,
   type CarouselCardSpec,
   type CreativeContent,
+  type VideoPlacement,
 } from "@/lib/meta/write";
 import type { ApiError } from "@/lib/types";
 import type { CampaignRow, DiscoveryResult } from "@/lib/discovery/types";
@@ -62,10 +64,25 @@ const bodySchema = z
     // Live writes currently support the from-scratch create flow only.
     mode: z.enum(["create", "duplicate"]).default("create"),
     // What the ad displays: a single image (default), a video, or a carousel.
-    // Video ads carry an already-registered, already-READY account-scoped video id
-    // from /api/video — raw video bytes never flow through this route (serverless
-    // body limits). Carousel ads carry 2-10 cards, each with its own image.
+    // Video ads carry 1-3 already-registered, already-READY account-scoped video ids
+    // from /api/video (one per aspect slot) — raw video bytes never flow through this
+    // route (serverless body limits). Carousel ads carry 2-10 cards, each with its image.
     format: z.enum(["single", "video", "carousel"]).default("single"),
+    // One video id per uploaded aspect slot. 2+ slots build a per-placement
+    // asset_feed_spec; a single slot keeps the proven single-video creative shape.
+    videos: z
+      .array(
+        z.object({
+          placement: z.enum(["square", "vertical", "horizontal"]),
+          videoId: z.string().regex(/^\d{1,32}$/),
+        }),
+      )
+      .min(1)
+      .max(3)
+      .optional(),
+    // TODO(remove next release): legacy single-video field. A modal loaded before this
+    // deploy still posts `videoId`; normalized to `videos: [{ placement: "square", … }]`
+    // below so an in-flight session survives the rollout.
     videoId: z.string().regex(/^\d{1,32}$/).optional(),
     adName: z.string().min(1).max(512),
     // Optional: target only ad sets whose name CONTAINS this (case-insensitive) in each
@@ -127,15 +144,30 @@ const bodySchema = z
       }
     }
     if (val.format === "video") {
-      if (!val.videoId) {
+      // Accept the new `videos[]` or the legacy `videoId` (normalized later).
+      const slots = val.videos ?? (val.videoId ? [{ placement: "square" as const, videoId: val.videoId }] : []);
+      if (slots.length === 0) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          path: ["videoId"],
-          message: "A registered videoId is required for video ads.",
+          path: ["videos"],
+          message: "At least one registered video is required for video ads.",
         });
       }
-      // video_data has no top-level link field; the destination lives only in the
-      // call_to_action, so "no button" cannot work for video.
+      // Each aspect slot may appear at most once — duplicate labels would collide in
+      // asset_feed_spec's placement rules.
+      const seen = new Set<string>();
+      for (const s of slots) {
+        if (seen.has(s.placement)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ["videos"],
+            message: `Duplicate video for the ${s.placement} slot.`,
+          });
+        }
+        seen.add(s.placement);
+      }
+      // video_data / asset_feed_spec has no top-level link field; the destination lives
+      // only in the call_to_action, so "no button" cannot work for video.
       if (!val.creative.cta || val.creative.cta === "NO_BUTTON") {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
@@ -187,6 +219,18 @@ function isHttpUrl(value: string): boolean {
   }
 }
 
+/** Human aspect label for a video slot, used in per-slot error messages. */
+function ratioLabel(placement: VideoPlacement["placement"]): string {
+  switch (placement) {
+    case "square":
+      return "square (1:1)";
+    case "vertical":
+      return "vertical (9:16)";
+    case "horizontal":
+      return "horizontal (16:9)";
+  }
+}
+
 export async function POST(
   req: NextRequest,
 ): Promise<NextResponse<CreateAdsResponse | ApiError>> {
@@ -210,9 +254,15 @@ export async function POST(
     return NextResponse.json({ error: `Invalid request (${where})` }, { status: 400 });
   }
 
-  const { accountSlug, mode, format, videoId, adName, campaignIds, creative, images, cards } =
+  const { accountSlug, mode, format, adName, campaignIds, creative, images, cards } =
     parsed.data;
   const adsetName = parsed.data.adsetName?.trim() || undefined;
+  // Normalize the video slots: prefer the new `videos[]`, else adapt the legacy
+  // single `videoId` (a modal open across the deploy). superRefine already checked
+  // presence + unique placements for video format.
+  const videos: VideoPlacement[] =
+    parsed.data.videos ??
+    (parsed.data.videoId ? [{ placement: "square", videoId: parsed.data.videoId }] : []);
 
   const authz = authorizeAccount(accountSlug);
   if (!authz.ok) {
@@ -369,36 +419,39 @@ export async function POST(
       return NextResponse.json({ error: `Could not upload the image: ${msg}` }, { status: 502 });
     }
 
-    // Video: confirm the registered video finished processing BEFORE any store
-    // writes — a not-ready video would fail every creative with an opaque Meta
-    // error. (superRefine guarantees videoId is present.)
-    if (format === "video" && videoId) {
-      try {
-        const status = await getVideoStatus(token, videoId);
-        if (status.status !== "ready") {
+    // Video: confirm EVERY uploaded aspect slot finished processing BEFORE any store
+    // writes — a not-ready video would fail every creative with an opaque Meta error.
+    // (superRefine guarantees >= 1 slot with unique placements.) The thumbnail (imageHash
+    // above) is shared across all slots.
+    if (format === "video") {
+      for (const v of videos) {
+        try {
+          const status = await getVideoStatus(token, v.videoId);
+          if (status.status !== "ready") {
+            return NextResponse.json(
+              {
+                error:
+                  status.status === "error"
+                    ? `Meta could not process the ${ratioLabel(v.placement)} video — try uploading a different file.`
+                    : `The ${ratioLabel(v.placement)} video is still processing on Meta's side — try again in a moment.`,
+              },
+              { status: 409 },
+            );
+          }
+        } catch (err) {
+          const msg =
+            err instanceof MetaApiError
+              ? metaErrorToMessage(err)
+              : err instanceof Error
+                ? err.message
+                : "Video check failed";
           return NextResponse.json(
-            {
-              error:
-                status.status === "error"
-                  ? "Meta could not process this video — try uploading a different file."
-                  : "The video is still processing on Meta's side — try again in a moment.",
-            },
-            { status: 409 },
+            { error: `Could not verify the ${ratioLabel(v.placement)} video: ${msg}` },
+            { status: 502 },
           );
         }
-      } catch (err) {
-        const msg =
-          err instanceof MetaApiError
-            ? metaErrorToMessage(err)
-            : err instanceof Error
-              ? err.message
-              : "Video check failed";
-        return NextResponse.json(
-          { error: `Could not verify the video: ${msg}` },
-          { status: 502 },
-        );
       }
-      content = { kind: "video", videoId, thumbnailHash: imageHash };
+      content = { kind: "video", videos, thumbnailHash: imageHash };
     } else {
       content = { kind: "image", imageHash };
     }
