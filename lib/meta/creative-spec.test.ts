@@ -11,9 +11,11 @@ import assert from "node:assert/strict";
 import {
   buildVideoAssetRules,
   buildCreativeParams,
+  buildDuplicateCreativeParams,
   type VideoPlacementKey,
   type CreativeContent,
   type CreativeInput,
+  type DuplicateSourceCreative,
 } from "./creative-spec.ts";
 
 const CREATIVE: CreativeInput = {
@@ -210,4 +212,215 @@ test("carousel creative is unchanged (child_attachments, per-card link fallback)
   assert.equal(kids[0].link, "https://example.com/spring"); // falls back to creative link
   assert.equal(kids[1].link, "https://example.com/two"); // own link wins
   assert.equal(kids[1].description, "d2");
+});
+
+// ── buildDuplicateCreativeParams ──────────────────────────────────────────────
+
+const DEST = { pageId: "PAGE_DEST", instagramUserId: "IG_DEST" };
+
+test("duplicate throws when the source ad has no readable creative", () => {
+  const source: DuplicateSourceCreative = { objectStorySpec: null, assetFeedSpec: null };
+  assert.throws(() =>
+    buildDuplicateCreativeParams({ ...DEST, source, overrides: { adName: "Spring Sale" } }),
+  );
+});
+
+test("duplicate: multi-ratio asset_feed_spec carries videos/rules over verbatim with no overrides", () => {
+  const sourceAfs = {
+    ad_formats: ["SINGLE_VIDEO"],
+    optimization_type: "PLACEMENT",
+    videos: [
+      { video_id: "V_SQ", thumbnail_hash: "T", adlabels: [{ name: "VID_SQUARE" }] },
+      { video_id: "V_VT", thumbnail_hash: "T", adlabels: [{ name: "VID_VERTICAL" }] },
+    ],
+    bodies: [{ text: "Old body" }],
+    titles: [{ text: "Old title" }],
+    descriptions: [{ text: "Old description" }],
+    link_urls: [{ website_url: "https://example.com/old" }],
+    call_to_action_types: ["LEARN_MORE"],
+    asset_customization_rules: [{ priority: 1, video_label: { name: "VID_SQUARE" } }],
+  };
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: { page_id: "PAGE_SOURCE", instagram_user_id: "IG_SOURCE" },
+    assetFeedSpec: sourceAfs,
+  };
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source,
+    overrides: { adName: "Spring Sale" }, // no overrides — pure carry-over
+  }) as any;
+
+  // Identity rebuilt fresh for the destination store, not copied from the source.
+  assert.deepEqual(params.object_story_spec, { page_id: "PAGE_DEST", instagram_user_id: "IG_DEST" });
+  // Every asset + rule preserved exactly — this IS the ratio carry-over.
+  assert.deepEqual(params.asset_feed_spec.videos, sourceAfs.videos);
+  assert.deepEqual(params.asset_feed_spec.asset_customization_rules, sourceAfs.asset_customization_rules);
+  assert.deepEqual(params.asset_feed_spec.bodies, sourceAfs.bodies);
+  assert.deepEqual(params.asset_feed_spec.call_to_action_types, sourceAfs.call_to_action_types);
+  // Mutating the result must never mutate the source (deep clone, not reference).
+  params.asset_feed_spec.videos.push({ video_id: "INTRUDER" });
+  assert.equal(sourceAfs.videos.length, 2);
+});
+
+test("duplicate: multi-ratio asset_feed_spec applies only the given overrides", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: { page_id: "PAGE_SOURCE" },
+    assetFeedSpec: {
+      videos: [{ video_id: "V_SQ", thumbnail_hash: "T", adlabels: [{ name: "VID_SQUARE" }] }],
+      bodies: [{ text: "Old body" }],
+      titles: [{ text: "Old title" }],
+      descriptions: [{ text: "Old description" }],
+      link_urls: [{ website_url: "https://example.com/old" }],
+      call_to_action_types: ["LEARN_MORE"],
+    },
+  };
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source,
+    overrides: { adName: "Spring Sale", primaryText: "New body", link: "https://example.com/new" },
+  }) as any;
+  assert.deepEqual(params.asset_feed_spec.bodies, [{ text: "New body" }]);
+  assert.deepEqual(params.asset_feed_spec.link_urls, [{ website_url: "https://example.com/new" }]);
+  // Untouched fields carry over from the source exactly.
+  assert.deepEqual(params.asset_feed_spec.titles, [{ text: "Old title" }]);
+  assert.deepEqual(params.asset_feed_spec.call_to_action_types, ["LEARN_MORE"]);
+});
+
+test("duplicate: single video_data — no overrides carries every field over, identity rebound", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: {
+      page_id: "PAGE_SOURCE",
+      instagram_user_id: "IG_SOURCE",
+      video_data: {
+        video_id: "V1",
+        image_hash: "THUMB",
+        title: "Old headline",
+        message: "Old body",
+        link_description: "Old sub",
+        call_to_action: { type: "SHOP_NOW", value: { link: "https://example.com/old" } },
+      },
+    },
+    assetFeedSpec: null,
+  };
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source,
+    overrides: { adName: "Spring Sale" },
+  }) as any;
+  assert.equal(params.object_story_spec.page_id, "PAGE_DEST");
+  assert.equal(params.object_story_spec.instagram_user_id, "IG_DEST");
+  assert.deepEqual(params.object_story_spec.video_data, {
+    video_id: "V1",
+    image_hash: "THUMB",
+    title: "Old headline",
+    message: "Old body",
+    link_description: "Old sub",
+    call_to_action: { type: "SHOP_NOW", value: { link: "https://example.com/old" } },
+  });
+});
+
+test("duplicate: single video_data — link override updates CTA value but keeps its type", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: {
+      page_id: "PAGE_SOURCE",
+      video_data: {
+        video_id: "V1",
+        image_hash: "THUMB",
+        call_to_action: { type: "SHOP_NOW", value: { link: "https://example.com/old" } },
+      },
+    },
+    assetFeedSpec: null,
+  };
+  const params = buildDuplicateCreativeParams({
+    pageId: "PAGE_DEST",
+    source,
+    overrides: { adName: "Spring Sale", link: "https://example.com/new" },
+  }) as any;
+  assert.deepEqual(params.object_story_spec.video_data.call_to_action, {
+    type: "SHOP_NOW",
+    value: { link: "https://example.com/new" },
+  });
+});
+
+test("duplicate: missing instagramUserId strips a stale instagram_user_id from the clone", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: {
+      page_id: "PAGE_SOURCE",
+      instagram_user_id: "IG_SOURCE",
+      video_data: { video_id: "V1", image_hash: "THUMB" },
+    },
+    assetFeedSpec: null,
+  };
+  const params = buildDuplicateCreativeParams({
+    pageId: "PAGE_DEST",
+    instagramUserId: null,
+    source,
+    overrides: { adName: "Spring Sale" },
+  }) as any;
+  assert.equal("instagram_user_id" in params.object_story_spec, false);
+});
+
+test("duplicate: single image (link_data, no child_attachments) — headline/subheadline map to name/description", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: {
+      page_id: "PAGE_SOURCE",
+      link_data: {
+        message: "Old body",
+        name: "Old headline",
+        description: "Old sub",
+        link: "https://example.com/old",
+        image_hash: "IMG",
+        call_to_action: { type: "SHOP_NOW", value: { link: "https://example.com/old" } },
+      },
+    },
+    assetFeedSpec: null,
+  };
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source,
+    overrides: { adName: "Spring Sale", headline: "New headline", cta: "LEARN_MORE" },
+  }) as any;
+  const ld = params.object_story_spec.link_data;
+  assert.equal(ld.name, "New headline");
+  assert.equal(ld.description, "Old sub"); // untouched
+  assert.equal(ld.image_hash, "IMG"); // asset reused verbatim
+  // New CTA type; link falls back to the (untouched) source link since no override given.
+  assert.deepEqual(ld.call_to_action, { type: "LEARN_MORE", value: { link: "https://example.com/old" } });
+});
+
+test("duplicate: carousel — child_attachments untouched even when headline/subheadline overrides are given", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: {
+      page_id: "PAGE_SOURCE",
+      link_data: {
+        message: "Old body",
+        link: "https://example.com/old",
+        child_attachments: [
+          { image_hash: "C1", name: "Card 1", link: "https://example.com/card1" },
+          { image_hash: "C2", name: "Card 2" },
+        ],
+        multi_share_optimized: false,
+      },
+    },
+    assetFeedSpec: null,
+  };
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source,
+    overrides: {
+      adName: "Spring Sale",
+      primaryText: "New body",
+      headline: "Should not apply to cards",
+      link: "https://example.com/new",
+    },
+  }) as any;
+  const ld = params.object_story_spec.link_data;
+  assert.equal(ld.message, "New body");
+  assert.equal(ld.link, "https://example.com/new");
+  // Cards are untouched — no per-card override UI exists in duplicate mode.
+  assert.deepEqual(ld.child_attachments, [
+    { image_hash: "C1", name: "Card 1", link: "https://example.com/card1" },
+    { image_hash: "C2", name: "Card 2" },
+  ]);
+  assert.equal(ld.multi_share_optimized, false);
 });
