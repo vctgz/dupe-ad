@@ -134,6 +134,21 @@ const bodySchema = z
       .optional(),
   })
   .superRefine((val, ctx) => {
+    // Each aspect slot may appear at most once — duplicate labels would collide in
+    // asset_feed_spec's placement rules. Applies to BOTH modes (Create's own videos
+    // and Duplicate's per-aspect overrides).
+    const seenSlots = new Set<string>();
+    for (const s of val.videos ?? []) {
+      if (seenSlots.has(s.placement)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["videos"],
+          message: `Duplicate video for the ${s.placement} slot.`,
+        });
+      }
+      seenSlots.add(s.placement);
+    }
+
     // Duplicate mode clones an already-valid creative and only patches explicit
     // overrides — none of Create's format/media requiredness applies. Only adName
     // (unconditionally required above) matters: it's the source ad to find.
@@ -184,19 +199,6 @@ const bodySchema = z
           path: ["videos"],
           message: "At least one registered video is required for video ads.",
         });
-      }
-      // Each aspect slot may appear at most once — duplicate labels would collide in
-      // asset_feed_spec's placement rules.
-      const seen = new Set<string>();
-      for (const s of slots) {
-        if (seen.has(s.placement)) {
-          ctx.addIssue({
-            code: z.ZodIssueCode.custom,
-            path: ["videos"],
-            message: `Duplicate video for the ${s.placement} slot.`,
-          });
-        }
-        seen.add(s.placement);
       }
       // video_data / asset_feed_spec has no top-level link field; the destination lives
       // only in the call_to_action, so "no button" cannot work for video.
@@ -261,6 +263,46 @@ function ratioLabel(placement: VideoPlacement["placement"]): string {
     case "horizontal":
       return "horizontal (16:9)";
   }
+}
+
+/**
+ * Confirm EVERY submitted aspect slot finished processing BEFORE any store writes —
+ * a not-ready video would fail every creative with an opaque Meta error. Returns the
+ * error response to send, or null when all slots are ready. Shared by Create (the
+ * ad's own videos) and Duplicate (per-aspect video overrides).
+ */
+async function verifyVideosReady(
+  token: string,
+  videos: VideoPlacement[],
+): Promise<NextResponse<ApiError> | null> {
+  for (const v of videos) {
+    try {
+      const status = await getVideoStatus(token, v.videoId);
+      if (status.status !== "ready") {
+        return NextResponse.json(
+          {
+            error:
+              status.status === "error"
+                ? `Meta could not process the ${ratioLabel(v.placement)} video — try uploading a different file.`
+                : `The ${ratioLabel(v.placement)} video is still processing on Meta's side — try again in a moment.`,
+          },
+          { status: 409 },
+        );
+      }
+    } catch (err) {
+      const msg =
+        err instanceof MetaApiError
+          ? metaErrorToMessage(err)
+          : err instanceof Error
+            ? err.message
+            : "Video check failed";
+      return NextResponse.json(
+        { error: `Could not verify the ${ratioLabel(v.placement)} video: ${msg}` },
+        { status: 502 },
+      );
+    }
+  }
+  return null;
 }
 
 export async function POST(
@@ -457,43 +499,23 @@ export async function POST(
         return NextResponse.json({ error: `Could not upload the image: ${msg}` }, { status: 502 });
       }
 
-      // Video: confirm EVERY uploaded aspect slot finished processing BEFORE any store
-      // writes — a not-ready video would fail every creative with an opaque Meta error.
-      // (superRefine guarantees >= 1 slot with unique placements.) The thumbnail (imageHash
-      // above) is shared across all slots.
+      // Video: every uploaded aspect slot must be READY before any store writes.
+      // (superRefine guarantees >= 1 slot with unique placements.) The thumbnail
+      // (imageHash above) is shared across all slots.
       if (format === "video") {
-        for (const v of videos) {
-          try {
-            const status = await getVideoStatus(token, v.videoId);
-            if (status.status !== "ready") {
-              return NextResponse.json(
-                {
-                  error:
-                    status.status === "error"
-                      ? `Meta could not process the ${ratioLabel(v.placement)} video — try uploading a different file.`
-                      : `The ${ratioLabel(v.placement)} video is still processing on Meta's side — try again in a moment.`,
-                },
-                { status: 409 },
-              );
-            }
-          } catch (err) {
-            const msg =
-              err instanceof MetaApiError
-                ? metaErrorToMessage(err)
-                : err instanceof Error
-                  ? err.message
-                  : "Video check failed";
-            return NextResponse.json(
-              { error: `Could not verify the ${ratioLabel(v.placement)} video: ${msg}` },
-              { status: 502 },
-            );
-          }
-        }
+        const notReady = await verifyVideosReady(token, videos);
+        if (notReady) return notReady;
         content = { kind: "video", videos, thumbnailHash: imageHash };
       } else {
         content = { kind: "image", imageHash };
       }
     }
+  } else if (videos.length > 0) {
+    // Duplicate-mode video overrides: same READY guarantee before any store writes.
+    // The slots themselves merge into each store's source creative per campaign,
+    // inside the write loop (buildDuplicateCreativeParams handles the shapes).
+    const notReady = await verifyVideosReady(token, videos);
+    if (notReady) return notReady;
   }
 
   // Resolve the account's conversion pixel so created ads have "Website events" tracking
@@ -628,6 +650,9 @@ export async function POST(
             link: overrideLink,
             cta: creative.cta,
           },
+          // Per-aspect video replacements (already verified READY above); empty
+          // keeps every ratio from this store's own source ad.
+          videoOverrides: videos.length > 0 ? videos : undefined,
         });
       } else {
         // Create: this store's landing page wins over the modal's fallback URL. A
