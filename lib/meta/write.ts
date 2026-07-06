@@ -2,9 +2,10 @@
 //
 // Creates fresh, PAGE-BOUND ads, one per store, all PAUSED (docs/01-meta-api-facts
 // #1, #3, #7). The cross-page fan-out is N brand-new creatives — one per store's
-// Page — built from the SAME uploaded image_hash (account-scoped, uploaded once,
-// #5). This is the from-scratch "Create new" engine; live duplicate-mode cloning
-// and multi-placement asset_feed_spec are deliberate follow-ups.
+// Page — built from the SAME uploaded image_hash / video_id (account-scoped,
+// uploaded once, #5). This is the from-scratch "Create new" engine; live
+// duplicate-mode cloning is a deliberate follow-up, and multi-placement
+// asset_feed_spec for STATIC IMAGES is still a follow-up (video already ships it).
 //
 // Nothing here is auto-run: the API route invokes it only on an explicit, confirmed
 // user action, and every ad is created PAUSED for per-ad review.
@@ -12,16 +13,23 @@ import "server-only";
 import { MetaApiError, get, getObject, post, postBatch } from "@/lib/meta/client";
 import { kvGet, kvSet } from "@/lib/kv";
 import type { AdAccount } from "@/config/accounts";
+import { buildCreativeParams, type CreativeContent, type CreativeInput } from "@/lib/meta/creative-spec";
 
-export interface CreativeInput {
-  adName: string;
-  primaryText: string;
-  headline: string;
-  subheadline: string;
-  link: string;
-  /** call_to_action_type (e.g. SHOP_NOW). "" / "NO_BUTTON" → no button. */
-  cta?: string;
-}
+// Creative-shape builders + their types live in the pure (server-only-free) module so
+// they can be unit-tested in isolation. Re-exported here so existing importers keep
+// pulling them from "@/lib/meta/write".
+export {
+  buildCreativeParams,
+  buildVideoAssetRules,
+} from "@/lib/meta/creative-spec";
+export type {
+  CreativeInput,
+  CreativeContent,
+  CarouselCardSpec,
+  VideoPlacement,
+  VideoPlacementKey,
+  VideoAssetRule,
+} from "@/lib/meta/creative-spec";
 
 /** Strip a `data:image/...;base64,` prefix, returning the bare base64 payload. */
 export function base64FromDataUrl(dataUrl: string): string | null {
@@ -178,113 +186,10 @@ export function pickAdsetFromList(adsets: MetaAdset[], adsetName?: string): Adse
   return { id: chosen.id, name: chosen.name ?? "" };
 }
 
-/** One carousel card. The image hash is account-scoped (uploaded once, reused). */
-export interface CarouselCardSpec {
-  imageHash: string;
-  headline: string;
-  description?: string;
-  /** Per-card destination. Absent -> the creative's (per-store) link. */
-  link?: string;
-}
-
 /**
- * What a creative displays. All variants are page-bound and reuse account-scoped
- * assets (image hashes / video ids), so the caller uploads each asset ONCE and
- * fans the SAME content out across every store's Page (#5).
- */
-export type CreativeContent =
-  | { kind: "image"; imageHash: string }
-  | { kind: "video"; videoId: string; thumbnailHash: string }
-  | { kind: "carousel"; cards: CarouselCardSpec[] };
-
-/**
- * Build the object_story_spec payload for a creative. Exported for the create route's
- * batch path; most callers want createCreative().
- *
- *   image    — link_data: `link` mirrored into call_to_action.value.link (#4).
- *   video    — video_data: NO top-level link field exists; the destination lives ONLY in
- *              call_to_action.value.link, so a real CTA is REQUIRED. A thumbnail
- *              image_hash is also required or Meta rejects the creative.
- *   carousel — link_data with child_attachments (2-10 cards). A card without its own
- *              link inherits the creative's (per-store) link, so mapped landing pages
- *              keep working card by card.
- */
-export function buildObjectStorySpec(args: {
-  pageId: string;
-  instagramUserId?: string | null;
-  content: CreativeContent;
-  creative: CreativeInput;
-}): Record<string, unknown> {
-  const { pageId, instagramUserId, content, creative } = args;
-  const useCta = !!creative.cta && creative.cta !== "NO_BUTTON";
-
-  const objectStorySpec: Record<string, unknown> = { page_id: pageId };
-  if (instagramUserId) objectStorySpec.instagram_user_id = instagramUserId;
-
-  if (content.kind === "video") {
-    if (!useCta) {
-      throw new Error(
-        "Video creatives need a call-to-action button to carry the destination link.",
-      );
-    }
-    objectStorySpec.video_data = {
-      video_id: content.videoId,
-      image_hash: content.thumbnailHash,
-      title: creative.headline,
-      message: creative.primaryText,
-      link_description: creative.subheadline,
-      call_to_action: { type: creative.cta, value: { link: creative.link } },
-    };
-    return objectStorySpec;
-  }
-
-  if (content.kind === "carousel") {
-    const childAttachments = content.cards.map((card) => {
-      const cardLink = card.link && card.link.trim().length > 0 ? card.link : creative.link;
-      const attachment: Record<string, unknown> = {
-        link: cardLink,
-        image_hash: card.imageHash,
-        name: card.headline,
-      };
-      if (card.description && card.description.trim().length > 0) {
-        attachment.description = card.description;
-      }
-      if (useCta) {
-        attachment.call_to_action = { type: creative.cta, value: { link: cardLink } };
-      }
-      return attachment;
-    });
-    objectStorySpec.link_data = {
-      message: creative.primaryText,
-      // The carousel's own destination (the "see more" surface / end behavior).
-      link: creative.link,
-      child_attachments: childAttachments,
-      // Keep the operator's card order — don't let Meta reshuffle by performance —
-      // and skip the auto-generated Page end card.
-      multi_share_optimized: false,
-      multi_share_end_card: false,
-    };
-    return objectStorySpec;
-  }
-
-  const linkData: Record<string, unknown> = {
-    message: creative.primaryText,
-    name: creative.headline,
-    description: creative.subheadline,
-    link: creative.link,
-    image_hash: content.imageHash,
-  };
-  if (useCta) {
-    linkData.call_to_action = { type: creative.cta, value: { link: creative.link } };
-  }
-  objectStorySpec.link_data = linkData;
-  return objectStorySpec;
-}
-
-/**
- * Create a page-bound creative (image link_data or video video_data) and return its
- * id. The page binding is immutable once set — this is a NEW creative for THIS
- * store's Page (#1).
+ * Create a page-bound creative (image/carousel link_data, single-video video_data, or
+ * a multi-aspect video asset_feed_spec) and return its id. The page binding is
+ * immutable once set — this is a NEW creative for THIS store's Page (#1).
  */
 export async function createCreative(
   account: AdAccount,
@@ -298,10 +203,7 @@ export async function createCreative(
 ): Promise<string> {
   const res = await post<{ id?: string }>(
     `act_${account.id}/adcreatives`,
-    {
-      name: `${args.creative.adName} — creative`,
-      object_story_spec: buildObjectStorySpec(args),
-    },
+    buildCreativeParams(args),
     token,
   );
   if (!res.id) throw new Error("Creative creation did not return an id.");
@@ -418,10 +320,7 @@ export async function createCreativeAndPausedAd(
         method: "POST",
         name: "creative",
         relativeUrl: `act_${account.id}/adcreatives`,
-        params: {
-          name: `${args.creative.adName} — creative`,
-          object_story_spec: buildObjectStorySpec(args),
-        },
+        params: buildCreativeParams(args),
       },
       { method: "POST", relativeUrl: `act_${account.id}/ads`, params: adParams },
     ],
