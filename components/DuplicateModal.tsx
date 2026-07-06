@@ -186,6 +186,8 @@ interface VideoState {
   uploadPct: number;
   processingPct: number | null;
   videoId: string | null;
+  /** The uploaded Blob URL (kept so it can be deleted once Meta is done with it). */
+  blobUrl: string | null;
   error: string | null;
   // Aspect-ratio check (advisory, like images) — null until the metadata probe lands.
   width: number | null;
@@ -196,6 +198,21 @@ interface VideoState {
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/**
+ * Best-effort delete of an uploaded video's Blob object once Meta no longer needs it —
+ * i.e. after processing settles to "ready" or "error". Fire-and-forget: a failed delete
+ * just leaves the object for later cleanup and must never disrupt the ad flow.
+ * `keepalive` lets it complete even if the modal closes right after.
+ */
+function cleanupVideoBlob(accountSlug: string, blobUrl: string): void {
+  void fetch("/api/blob-upload", {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ accountSlug, url: blobUrl }),
+    keepalive: true,
+  }).catch(() => {});
+}
 
 /** Closest target ratio + whether the image is within tolerance of any of them. */
 function validateRatio(
@@ -1158,6 +1175,7 @@ export default function DuplicateModal({
             uploadPct: 0,
             processingPct: null,
             videoId: null,
+            blobUrl: null,
             error: null,
             width: null,
             height: null,
@@ -1208,8 +1226,14 @@ export default function DuplicateModal({
               patch((v) => ({ ...v, uploadPct: percentage }));
             },
           });
-          if (videoGenRef.current[key] !== gen) return;
-          patch((v) => ({ ...v, phase: "registering" }));
+          const blobUrl = blob.url;
+          // Cleared/replaced mid-upload: Meta was never handed this URL, so the object
+          // is a pure orphan — safe to delete right away.
+          if (videoGenRef.current[key] !== gen) {
+            cleanupVideoBlob(accountSlug, blobUrl);
+            return;
+          }
+          patch((v) => ({ ...v, phase: "registering", blobUrl }));
 
           const res = await fetch("/api/video", {
             method: "POST",
@@ -1242,9 +1266,14 @@ export default function DuplicateModal({
             if (videoGenRef.current[key] !== gen) return;
             if (sbody.status === "ready") {
               patch((v) => ({ ...v, phase: "ready", processingPct: 100 }));
+              // Meta has the processed copy now — the Blob upload is no longer needed.
+              cleanupVideoBlob(accountSlug, blobUrl);
               return;
             }
             if (sbody.status === "error") {
+              // A confirmed processing failure is also a safe deletion point: Meta is
+              // done with the file and won't download it again.
+              cleanupVideoBlob(accountSlug, blobUrl);
               throw new Error("Meta could not process this video — try a different file.");
             }
             patch((v) => ({ ...v, processingPct: sbody.progress ?? v.processingPct }));
