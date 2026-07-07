@@ -16,10 +16,13 @@ const csp = [
   "img-src 'self' data: blob:",
   "media-src 'self' blob:",
   "font-src 'self' data:",
-  // Videos upload straight from the browser to Vercel Blob (the token is minted by
-  // /api/blob-upload, but the PUT goes cross-origin to <store>.public.blob.vercel-storage.com).
-  // Without this the upload is silently blocked and the UI hangs at "Uploading… 0%".
-  "connect-src 'self' https://*.blob.vercel-storage.com",
+  // Videos upload straight from the browser to Vercel Blob: the token is minted by
+  // /api/blob-upload, then the SDK PUTs to the Blob API at https://vercel.com/api/blob/
+  // (NOT *.blob.vercel-storage.com — that's only the public read host). Without the
+  // vercel.com entry the upload fetch is CSP-blocked; the SDK treats that as a network
+  // error and silently retries, so the UI hangs at "Uploading… 0%" with no error.
+  // The path-scoped source keeps the rest of vercel.com off-limits.
+  "connect-src 'self' https://vercel.com/api/blob/ https://*.blob.vercel-storage.com",
   "frame-ancestors 'none'",
   "base-uri 'self'",
   "object-src 'none'",
