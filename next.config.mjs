@@ -14,8 +14,12 @@ const csp = [
   `script-src 'self' 'unsafe-inline'${isProd ? "" : " 'unsafe-eval'"}`,
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob:",
+  "media-src 'self' blob:",
   "font-src 'self' data:",
-  "connect-src 'self'",
+  // Videos upload straight from the browser to Vercel Blob (the token is minted by
+  // /api/blob-upload, but the PUT goes cross-origin to <store>.public.blob.vercel-storage.com).
+  // Without this the upload is silently blocked and the UI hangs at "Uploading… 0%".
+  "connect-src 'self' https://*.blob.vercel-storage.com",
   "frame-ancestors 'none'",
   "base-uri 'self'",
   "object-src 'none'",
