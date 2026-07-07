@@ -1227,8 +1227,14 @@ export default function DuplicateModal({
             access: "public",
             handleUploadUrl: "/api/blob-upload",
             clientPayload: JSON.stringify({ accountSlug }),
-            onUploadProgress: ({ percentage }) => {
-              patch((v) => ({ ...v, uploadPct: percentage }));
+            onUploadProgress: ({ loaded, percentage }) => {
+              // Derive the percentage from raw bytes against the known file size rather
+              // than trusting the SDK's `percentage`: on some transports it reports a
+              // total of 0 and pins the value to 0% for the whole upload (then jumps to
+              // 100%). `file.size` is always accurate here, so loaded/size never does.
+              const pct =
+                file.size > 0 ? Math.min(100, (loaded / file.size) * 100) : percentage;
+              patch((v) => ({ ...v, uploadPct: Math.max(v.uploadPct, pct) }));
             },
           });
           const blobUrl = blob.url;
