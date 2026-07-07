@@ -1227,6 +1227,12 @@ export default function DuplicateModal({
             access: "public",
             handleUploadUrl: "/api/blob-upload",
             clientPayload: JSON.stringify({ accountSlug }),
+            // Upload in 8MB parts. Besides per-part retries (good for 100MB+ videos),
+            // this is what makes the progress counter real: the default single-request
+            // mode streams via fetch, whose "progress" counts bytes buffered by the
+            // browser — not bytes sent — so the counter freezes. Multipart progress
+            // advances as parts actually complete.
+            multipart: true,
             onUploadProgress: ({ loaded, percentage }) => {
               // Derive the percentage from raw bytes against the known file size rather
               // than trusting the SDK's `percentage`: on some transports it reports a
