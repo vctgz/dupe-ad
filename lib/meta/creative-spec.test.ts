@@ -641,3 +641,226 @@ test("override: non-video source ad throws (per-store error, not silent conversi
     /isn't a video ad/,
   );
 });
+
+// ── Read-back sanitization (the regression the clean fixtures above cannot catch) ──
+//
+// findSourceAdCreative feeds Meta's READ representation of a creative straight into
+// buildDuplicateCreativeParams. Read-back carries output-only fields that the write
+// endpoint rejects with a generic `error 100 (Invalid parameter)`: adlabels/video_label
+// echoed as {id, name, created_time}, per-asset {id} on every copy/link asset,
+// customization_spec expanded with age_* defaults, and a signed thumbnail_url in place of
+// a hash. These fixtures MIMIC that real read-back; every test above used pre-cleaned data.
+
+/** A multi-ratio video asset_feed_spec exactly as Graph reads one back (contaminated). */
+function readBackVideoAfs(): DuplicateSourceCreative {
+  return {
+    objectStorySpec: { page_id: "PAGE_SOURCE", instagram_user_id: "IG_SOURCE" },
+    assetFeedSpec: {
+      ad_formats: ["SINGLE_VIDEO"],
+      optimization_type: "PLACEMENT",
+      videos: [
+        {
+          video_id: "V_SQ",
+          // read-back often carries ONLY a signed, expiring url (no hash).
+          thumbnail_url: "https://scontent.xx.fbcdn.net/v/t15/sq?oh=SIG&oe=EXP",
+          adlabels: [{ id: "6301", name: "VID_SQUARE", created_time: "2026-01-01T00:00:00+0000" }],
+        },
+        {
+          video_id: "V_VT",
+          thumbnail_hash: "T_HASH",
+          adlabels: [{ id: "6302", name: "VID_VERTICAL", created_time: "2026-01-01T00:00:00+0000" }],
+        },
+      ],
+      bodies: [{ text: "Old body", id: "b1" }],
+      titles: [{ text: "Old title", id: "t1" }],
+      descriptions: [{ text: "Old desc", id: "d1" }],
+      link_urls: [{ website_url: "https://example.com/old", display_url: "example.com", id: "l1" }],
+      call_to_action_types: ["LEARN_MORE"],
+      asset_customization_rules: [
+        {
+          customization_spec: {
+            age_min: 18,
+            age_max: 65,
+            genders: [1, 2],
+            publisher_platforms: ["facebook", "instagram"],
+            facebook_positions: ["story", "facebook_reels"],
+            instagram_positions: ["story", "reels"],
+          },
+          video_label: { id: "6302", name: "VID_VERTICAL", created_time: "2026-01-01T00:00:00+0000" },
+          priority: 1,
+        },
+        {
+          customization_spec: {
+            age_min: 18,
+            age_max: 65,
+            publisher_platforms: ["facebook", "instagram"],
+            facebook_positions: ["feed"],
+            instagram_positions: ["stream"],
+          },
+          video_label: { id: "6301", name: "VID_SQUARE", created_time: "2026-01-01T00:00:00+0000" },
+          priority: 2,
+        },
+      ],
+    },
+  };
+}
+
+/** No output-only key may survive anywhere in a body about to be POSTed. */
+function assertNoReadBackJunk(spec: unknown) {
+  const json = JSON.stringify(spec);
+  for (const banned of ['"id"', "created_time", "age_min", "age_max", "genders", "display_url"]) {
+    assert.ok(!json.includes(banned), `sanitized body still contains ${banned}: ${json}`);
+  }
+}
+
+test("read-back: multi-ratio afs (no overrides) is re-projected to a write-safe body", () => {
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source: readBackVideoAfs(),
+    overrides: { adName: "Spring Sale" },
+  }) as any;
+  const afs = params.asset_feed_spec;
+
+  // videos: id + exactly ONE thumbnail + name-only adlabels (id/created_time gone).
+  assert.deepEqual(afs.videos, [
+    {
+      video_id: "V_SQ",
+      thumbnail_url: "https://scontent.xx.fbcdn.net/v/t15/sq?oh=SIG&oe=EXP",
+      adlabels: [{ name: "VID_SQUARE" }],
+    },
+    { video_id: "V_VT", thumbnail_hash: "T_HASH", adlabels: [{ name: "VID_VERTICAL" }] },
+  ]);
+  // copy/link arrays: per-asset id (and display_url) stripped to just {text}/{website_url}.
+  assert.deepEqual(afs.bodies, [{ text: "Old body" }]);
+  assert.deepEqual(afs.titles, [{ text: "Old title" }]);
+  assert.deepEqual(afs.descriptions, [{ text: "Old desc" }]);
+  assert.deepEqual(afs.link_urls, [{ website_url: "https://example.com/old" }]);
+  assert.deepEqual(afs.call_to_action_types, ["LEARN_MORE"]);
+  // rules: demographic keys stripped, video_label name-only, priority + placements kept.
+  assert.deepEqual(afs.asset_customization_rules, [
+    {
+      customization_spec: {
+        publisher_platforms: ["facebook", "instagram"],
+        facebook_positions: ["story", "facebook_reels"],
+        instagram_positions: ["story", "reels"],
+      },
+      video_label: { name: "VID_VERTICAL" },
+      priority: 1,
+    },
+    {
+      customization_spec: {
+        publisher_platforms: ["facebook", "instagram"],
+        facebook_positions: ["feed"],
+        instagram_positions: ["stream"],
+      },
+      video_label: { name: "VID_SQUARE" },
+      priority: 2,
+    },
+  ]);
+  assertNoReadBackJunk(afs);
+  // Identity is still rebound to the destination store.
+  assert.deepEqual(params.object_story_spec, { page_id: "PAGE_DEST", instagram_user_id: "IG_DEST" });
+});
+
+test("read-back: copy/video overrides on a contaminated afs stay sanitized", () => {
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source: readBackVideoAfs(),
+    overrides: { adName: "Spring Sale", primaryText: "Fresh body" },
+    videoOverrides: [{ placement: "square", videoId: "V_NEW" }],
+  }) as any;
+  const afs = params.asset_feed_spec;
+  // Override applied over the read-back value.
+  assert.deepEqual(afs.bodies, [{ text: "Fresh body" }]);
+  // The swap goes THROUGH the contaminated entry — its adlabels must still come out clean.
+  const sq = afs.videos.find((v: any) => v.adlabels[0].name === "VID_SQUARE");
+  assert.equal(sq.video_id, "V_NEW");
+  for (const v of afs.videos) assert.deepEqual(Object.keys(v.adlabels[0]), ["name"]);
+  assertNoReadBackJunk(afs);
+});
+
+test("read-back: single video_data is whitelisted (junk dropped, hash beats signed url)", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: {
+      page_id: "PAGE_SOURCE",
+      video_data: {
+        video_id: "V1",
+        image_hash: "THUMB",
+        image_url: "https://scontent.xx.fbcdn.net/thumb?oh=SIG&oe=EXP",
+        title: "Old headline",
+        message: "Old body",
+        link_description: "Old sub",
+        call_to_action: { type: "SHOP_NOW", value: { link: "https://example.com/old" } },
+        // output-only fields Graph adds on read-back:
+        video_encoding_status: "ready",
+        id: "23848",
+      },
+    },
+    assetFeedSpec: null,
+  };
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source,
+    overrides: { adName: "Spring Sale" },
+  }) as any;
+  assert.deepEqual(params.object_story_spec.video_data, {
+    video_id: "V1",
+    image_hash: "THUMB", // hash preferred; signed image_url dropped
+    title: "Old headline",
+    message: "Old body",
+    link_description: "Old sub",
+    call_to_action: { type: "SHOP_NOW", value: { link: "https://example.com/old" } },
+  });
+});
+
+test("read-back: video_data with only a signed image_url keeps it as thumbnail fallback", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: {
+      page_id: "PAGE_SOURCE",
+      video_data: {
+        video_id: "V1",
+        image_url: "https://cdn/thumb.jpg",
+        call_to_action: { type: "SHOP_NOW", value: { link: "https://example.com/x" } },
+      },
+    },
+    assetFeedSpec: null,
+  };
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source,
+    overrides: { adName: "Spring Sale" },
+  }) as any;
+  assert.equal(params.object_story_spec.video_data.image_url, "https://cdn/thumb.jpg");
+  assert.equal("image_hash" in params.object_story_spec.video_data, false);
+});
+
+test("H2: single video_data with blank copy rebuilt multi-ratio omits empty text arrays", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: {
+      page_id: "PAGE_SOURCE",
+      video_data: {
+        video_id: "V_OLD",
+        image_hash: "THUMB",
+        // NO message/title/link_description — must not become [{ text: "" }] (Meta rejects it).
+        call_to_action: { type: "SHOP_NOW", value: { link: "https://example.com/x" } },
+      },
+    },
+    assetFeedSpec: null,
+  };
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source,
+    overrides: { adName: "Spring Sale" },
+    videoOverrides: [
+      { placement: "square", videoId: "V_SQ" },
+      { placement: "vertical", videoId: "V_VT" },
+    ],
+  }) as any;
+  const afs = params.asset_feed_spec;
+  // The required link survives; the blank copy arrays are omitted, not sent empty.
+  assert.deepEqual(afs.link_urls, [{ website_url: "https://example.com/x" }]);
+  assert.equal("bodies" in afs, false);
+  assert.equal("titles" in afs, false);
+  assert.equal("descriptions" in afs, false);
+  assert.ok(!JSON.stringify(afs).includes('"text":""'), "an empty {text:''} slipped through");
+});

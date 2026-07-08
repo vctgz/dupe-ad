@@ -18,6 +18,11 @@ export class MetaApiError extends Error {
   readonly type: string | null;
   readonly httpStatus: number;
   readonly fbtraceId: string | null;
+  /** Meta's human-readable cause, when present (error_user_title / error_user_msg).
+   *  Code 100 is a generic catch-all — these two are what actually name the bad param
+   *  (e.g. "Your creative contains an invalid thumbnail"). null when Meta omits them. */
+  readonly userTitle: string | null;
+  readonly userMsg: string | null;
   /** For rate-limit errors: Meta's estimate (minutes) until access returns, from the
    *  usage headers on the failing response. null when unknown / not a rate limit. */
   readonly retryAfterMinutes: number | null;
@@ -29,6 +34,8 @@ export class MetaApiError extends Error {
     type: string | null;
     httpStatus: number;
     fbtraceId?: string | null;
+    userTitle?: string | null;
+    userMsg?: string | null;
     retryAfterMinutes?: number | null;
   }) {
     super(args.message);
@@ -38,6 +45,8 @@ export class MetaApiError extends Error {
     this.type = args.type;
     this.httpStatus = args.httpStatus;
     this.fbtraceId = args.fbtraceId ?? null;
+    this.userTitle = args.userTitle ?? null;
+    this.userMsg = args.userMsg ?? null;
     this.retryAfterMinutes = args.retryAfterMinutes ?? null;
   }
 }
@@ -67,7 +76,12 @@ export function metaErrorToMessage(err: MetaApiError): string {
     }
     return "Meta's API rate limit was reached — please wait a minute and try again.";
   }
-  return `Meta API error (${err.code ?? "?"}): ${err.message}`;
+  // Prefer Meta's human-readable cause over the generic code-100 "message", and include
+  // the subcode when present — subcodes (e.g. 1487390 "Ad creative is invalid") and the
+  // user message are what actually pinpoint an otherwise-opaque "Invalid parameter".
+  const codeStr = err.subcode ? `${err.code ?? "?"}/${err.subcode}` : String(err.code ?? "?");
+  const detail = err.userMsg?.trim() || err.userTitle?.trim() || err.message;
+  return `Meta API error (${codeStr}): ${detail}`;
 }
 
 /**
@@ -231,6 +245,27 @@ function recordUsage(headers: Headers, path: string): MetaUsage | null {
   return usage;
 }
 
+/** The shape of Meta's `{ error: { ... } }` body — every field it may carry that we read. */
+interface MetaErrorFields {
+  message?: string;
+  code?: number;
+  error_subcode?: number;
+  type?: string;
+  fbtrace_id?: string;
+  /** Human-readable cause — the load-bearing diagnostics for a generic code 100. */
+  error_user_title?: string;
+  error_user_msg?: string;
+}
+
+/** Pull Meta's `error` sub-object out of a parsed response/batch-op body, or null. */
+function extractMetaError(body: unknown): MetaErrorFields | null {
+  if (body && typeof body === "object" && "error" in body) {
+    const e = (body as { error?: unknown }).error;
+    if (e && typeof e === "object") return e as MetaErrorFields;
+  }
+  return null;
+}
+
 async function throwMetaError(
   res: Response,
   path: string,
@@ -242,18 +277,7 @@ async function throwMetaError(
   } catch {
     // non-JSON error body
   }
-  const err =
-    body && typeof body === "object" && "error" in body
-      ? (body as {
-          error: {
-            message?: string;
-            code?: number;
-            error_subcode?: number;
-            type?: string;
-            fbtrace_id?: string;
-          };
-        }).error
-      : null;
+  const err = extractMetaError(body);
 
   const code = err?.code ?? null;
   throw new MetaApiError({
@@ -263,6 +287,8 @@ async function throwMetaError(
     type: err?.type ?? null,
     httpStatus: res.status,
     fbtraceId: err?.fbtrace_id ?? null,
+    userTitle: err?.error_user_title ?? null,
+    userMsg: err?.error_user_msg ?? null,
     // Only meaningful when Meta is throttling us; other errors leave it null.
     retryAfterMinutes:
       code != null && RATE_LIMIT_CODES.has(code) && usage && usage.regainMinutes > 0
@@ -472,20 +498,31 @@ export async function postBatch<T = unknown>(
       continue;
     }
     // First failed op: surface it as a typed error (same shape as a single call).
-    const errObj =
-      parsed && typeof parsed === "object" && "error" in parsed
-        ? (parsed as { error: { message?: string; code?: number; error_subcode?: number; type?: string; fbtrace_id?: string } }).error
-        : null;
+    const errObj = extractMetaError(parsed);
     const code = errObj?.code ?? null;
+    const relativeUrl = ops[i]?.relativeUrl ?? "?";
+    // Which op failed + every diagnostic Meta returned. A creative/ad batch fails as a
+    // whole otherwise-opaque code 100; naming the op (adcreatives vs ads) and dumping the
+    // subcode + error_user_msg here is what makes the cause recoverable from the logs.
+    // eslint-disable-next-line no-console
+    console.error(
+      `[meta] batch op ${i} (${relativeUrl}) failed: code=${code ?? "?"} ` +
+        `subcode=${errObj?.error_subcode ?? "-"} http=${item.code ?? "?"} ` +
+        `fbtrace=${errObj?.fbtrace_id ?? "-"}` +
+        (errObj?.error_user_title ? ` title=${JSON.stringify(errObj.error_user_title)}` : "") +
+        (errObj?.error_user_msg ? ` msg=${JSON.stringify(errObj.error_user_msg)}` : ""),
+    );
     throw new MetaApiError({
       message:
         errObj?.message ??
-        `Batch operation ${i} (${ops[i]?.relativeUrl ?? "?"}) failed (HTTP ${item.code ?? "?"})`,
+        `Batch operation ${i} (${relativeUrl}) failed (HTTP ${item.code ?? "?"})`,
       code,
       subcode: errObj?.error_subcode ?? null,
       type: errObj?.type ?? null,
       httpStatus: item.code ?? 500,
       fbtraceId: errObj?.fbtrace_id ?? null,
+      userTitle: errObj?.error_user_title ?? null,
+      userMsg: errObj?.error_user_msg ?? null,
       retryAfterMinutes:
         code != null && RATE_LIMIT_CODES.has(code) && usage && usage.regainMinutes > 0
           ? usage.regainMinutes

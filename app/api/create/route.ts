@@ -574,6 +574,9 @@ export async function POST(
     const row = byId.get(campaignId);
     const storeCode = row?.storeCode ?? null;
     const campaignName = row?.campaignName ?? "(unknown campaign)";
+    // Captured once the params are built so the catch can dump EXACTLY what we POSTed
+    // when a store fails — code 100 says nothing about which field was bad, the body does.
+    let sentCreativeParams: Record<string, unknown> | null = null;
     try {
       const pageId = row?.mappedPage ?? row?.actualPage ?? null;
       if (!pageId) {
@@ -674,6 +677,8 @@ export async function POST(
         });
       }
 
+      sentCreativeParams = creativeParams;
+
       // One batched round trip per store: creative + PAUSED ad as dependent Graph
       // batch ops (both still count individually toward rate limits).
       const writeOne = (): Promise<string> =>
@@ -712,7 +717,19 @@ export async function POST(
             ? err.message
             : "Create failed";
       // eslint-disable-next-line no-console
-      console.error(`[create] ${account.slug} campaign ${campaignId} failed: ${msg}`);
+      console.error(
+        `[create] ${account.slug} campaign ${campaignId} failed: ${msg}` +
+          (err instanceof MetaApiError && err.fbtraceId ? ` [fbtrace ${err.fbtraceId}]` : ""),
+      );
+      // On a Meta rejection, record the exact body we sent (size-capped) — this is the
+      // difference between "code 100 somewhere" and seeing the offending param verbatim.
+      if (err instanceof MetaApiError && sentCreativeParams) {
+        const dump = JSON.stringify(sentCreativeParams);
+        const capped =
+          dump.length > 8000 ? `${dump.slice(0, 8000)}…(+${dump.length - 8000} more chars)` : dump;
+        // eslint-disable-next-line no-console
+        console.error(`[create] ${account.slug} campaign ${campaignId} creativeParams=${capped}`);
+      }
       results.push({ campaignId, storeCode, campaignName, ok: false, error: msg });
     }
   }

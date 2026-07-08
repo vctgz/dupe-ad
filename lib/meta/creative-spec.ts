@@ -474,6 +474,152 @@ function applyVideoOverrides(
   );
 }
 
+// ── Read-back → write-safe sanitizers ───────────────────────────────────────────
+//
+// Graph's creative READ representation (what findSourceAdCreative pulls) is NOT a valid
+// write body: it carries output-only fields the write endpoint rejects with a generic
+// `error 100 (Invalid parameter)`. Before POSTing a cloned spec we re-project it through
+// a fixed whitelist so only write-accepted params survive. These run on the VIDEO shapes
+// (asset_feed_spec with videos[], and single video_data) — the image/carousel link_data
+// clone path is left untouched (it is already proven live and mostly input-shaped).
+
+/** Read-back adlabels are `[{id,name,created_time}]`; a write needs only `[{name}]`. */
+function cleanLabelNames(labels: unknown): { name: string }[] | undefined {
+  if (!Array.isArray(labels)) return undefined;
+  const out: { name: string }[] = [];
+  for (const l of labels) {
+    const name = l && typeof l === "object" ? (l as { name?: unknown }).name : undefined;
+    if (typeof name === "string" && name.length > 0) out.push({ name });
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+/** Keep only a videos[] entry's write-safe keys: the id, ONE thumbnail (the stable hash
+ *  preferred over a signed/expiring url), and name-only adlabels. */
+function cleanVideoEntry(entry: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (entry.video_id !== undefined) out.video_id = entry.video_id;
+  if (entry.thumbnail_hash !== undefined) out.thumbnail_hash = entry.thumbnail_hash;
+  else if (entry.thumbnail_url !== undefined) out.thumbnail_url = entry.thumbnail_url;
+  const labels = cleanLabelNames(entry.adlabels);
+  if (labels) out.adlabels = labels;
+  return out;
+}
+
+/** Copy assets (bodies/titles/descriptions) read back with a per-asset `id`; a write needs
+ *  only `{text}`. Meta rejects `{text:""}`, so blank entries are dropped and an all-blank
+ *  array is omitted entirely (returns undefined) rather than sent. */
+function cleanTextAssets(arr: unknown): { text: string }[] | undefined {
+  if (!Array.isArray(arr)) return undefined;
+  const out: { text: string }[] = [];
+  for (const a of arr) {
+    const text = a && typeof a === "object" ? (a as { text?: unknown }).text : undefined;
+    if (typeof text === "string" && text.trim().length > 0) out.push({ text });
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+/** link_urls read back with a per-asset `id`; a write needs only `{website_url}`. */
+function cleanLinkUrls(arr: unknown): { website_url: string }[] | undefined {
+  if (!Array.isArray(arr)) return undefined;
+  const out: { website_url: string }[] = [];
+  for (const a of arr) {
+    const url =
+      a && typeof a === "object" ? (a as { website_url?: unknown }).website_url : undefined;
+    if (typeof url === "string" && url.trim().length > 0) out.push({ website_url: url });
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+/** Placement/platform keys a customization_spec may carry into a write. Read-back also
+ *  expands it with demographic defaults (age_min/age_max/genders/…) that don't belong. */
+const PLACEMENT_SPEC_KEYS = new Set([
+  "publisher_platforms",
+  "facebook_positions",
+  "instagram_positions",
+  "audience_network_positions",
+  "messenger_positions",
+  "threads_positions",
+]);
+
+/** Re-project one asset_customization_rule: placement-only customization_spec, name-only
+ *  label (video_label reads back as `{id,name,created_time}`), and priority. */
+function cleanRule(rule: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  const spec = rule.customization_spec;
+  if (spec && typeof spec === "object" && !Array.isArray(spec)) {
+    const cleanSpec: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(spec as Record<string, unknown>)) {
+      if (PLACEMENT_SPEC_KEYS.has(k)) cleanSpec[k] = v;
+    }
+    out.customization_spec = cleanSpec;
+  }
+  // Preserve whichever *_label the rule keys on (video_label for our feeds), name-only.
+  for (const [k, v] of Object.entries(rule)) {
+    if (k.endsWith("_label")) {
+      const name = v && typeof v === "object" ? (v as { name?: unknown }).name : undefined;
+      if (typeof name === "string" && name.length > 0) out[k] = { name };
+    }
+  }
+  if (typeof rule.priority === "number") out.priority = rule.priority;
+  return out;
+}
+
+/**
+ * Rebuild a cloned VIDEO `asset_feed_spec` from a fixed whitelist so no read-back
+ * output-only field survives into the write. Only video-bearing specs reach here
+ * (videos[] present); copy/link arrays that come out empty are omitted, not sent as
+ * `[{text:""}]`. Non-video (image) asset feeds are never passed here.
+ */
+function sanitizeVideoAssetFeedSpec(afs: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (afs.ad_formats !== undefined) out.ad_formats = afs.ad_formats;
+  if (afs.optimization_type !== undefined) out.optimization_type = afs.optimization_type;
+  out.videos = (afs.videos as Record<string, unknown>[]).map(cleanVideoEntry);
+  const bodies = cleanTextAssets(afs.bodies);
+  if (bodies) out.bodies = bodies;
+  const titles = cleanTextAssets(afs.titles);
+  if (titles) out.titles = titles;
+  const descriptions = cleanTextAssets(afs.descriptions);
+  if (descriptions) out.descriptions = descriptions;
+  const linkUrls = cleanLinkUrls(afs.link_urls);
+  if (linkUrls) out.link_urls = linkUrls;
+  if (Array.isArray(afs.call_to_action_types) && afs.call_to_action_types.length > 0) {
+    out.call_to_action_types = afs.call_to_action_types;
+  }
+  if (Array.isArray(afs.asset_customization_rules)) {
+    out.asset_customization_rules = (
+      afs.asset_customization_rules as Record<string, unknown>[]
+    ).map(cleanRule);
+  }
+  return out;
+}
+
+/** Whitelisted keys of a single-video `video_data` write body. */
+const VIDEO_DATA_KEYS = [
+  "video_id",
+  "image_hash",
+  "image_url",
+  "title",
+  "message",
+  "link_description",
+  "call_to_action",
+] as const;
+
+/**
+ * Whitelist a cloned single-video `video_data` down to write-safe params. Prefers the
+ * stable `image_hash` thumbnail; keeps the signed/expiring `image_url` only when no hash
+ * is present. Drops every read-back output-only field.
+ */
+function sanitizeVideoData(vd: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const k of VIDEO_DATA_KEYS) {
+    if (k === "image_url" && vd.image_hash !== undefined) continue; // hash wins
+    if (vd[k] !== undefined) out[k] = vd[k];
+  }
+  return out;
+}
+
 /**
  * Build fresh `POST .../adcreatives` params for DUPLICATE mode. Starts from a deep
  * clone of the SOURCE ad's own creative, rebinds the page/IG identity to the
@@ -514,7 +660,15 @@ export function buildDuplicateCreativeParams(args: {
     if (overrides.cta) afs.call_to_action_types = [overrides.cta];
     const identity: Record<string, unknown> = { page_id: pageId };
     if (instagramUserId) identity.instagram_user_id = instagramUserId;
-    return { name, object_story_spec: identity, asset_feed_spec: afs };
+    // Read-back JSON isn't a valid write body — strip output-only contamination (asset
+    // ids, adlabels/video_label id+created_time, age-expanded customization_spec, signed
+    // thumbnail urls) from any VIDEO spec before POSTing. Image asset feeds (no videos[])
+    // pass through unchanged.
+    const cleaned =
+      Array.isArray(afs.videos) && (afs.videos as unknown[]).length > 0
+        ? sanitizeVideoAssetFeedSpec(afs)
+        : afs;
+    return { name, object_story_spec: identity, asset_feed_spec: cleaned };
   }
 
   const oss = cloneJson(source.objectStorySpec!);
@@ -536,6 +690,9 @@ export function buildDuplicateCreativeParams(args: {
         value: { ...prevValue, link: overrides.link ?? prevValue.link },
       };
     }
+    // Whitelist the cloned video_data down to write-safe params (read-back adds
+    // output-only fields; prefer image_hash over the signed image_url thumbnail).
+    oss.video_data = sanitizeVideoData(vd);
   } else if (oss.link_data) {
     const ld = oss.link_data as Record<string, unknown>;
     if (overrides.primaryText) ld.message = overrides.primaryText;
