@@ -301,9 +301,11 @@ function encodeImageFile(file: File): Promise<string> {
  * play/pause, and (3) wait for an actually-presented frame via requestVideoFrameCallback
  * where available before drawing.
  */
-async function extractVideoFrameFile(
-  file: File,
-): Promise<{ file: File; url: string; width: number; height: number } | null> {
+type FrameGrab =
+  | { ok: true; file: File; url: string; width: number; height: number }
+  | { ok: false; stage: string };
+
+async function extractVideoFrameFile(file: File): Promise<FrameGrab> {
   const objectUrl = URL.createObjectURL(file);
   const video = document.createElement("video");
   video.muted = true;
@@ -335,28 +337,36 @@ async function extractVideoFrameFile(
       video.addEventListener("error", bad, { once: true });
     });
 
+  let stage = "start";
   try {
     document.body.appendChild(video);
     video.src = objectUrl;
-    await waitFor("loadedmetadata", 15_000);
+    stage = "metadata";
+    await waitFor("loadedmetadata", 8_000);
     const w = video.videoWidth;
     const h = video.videoHeight;
     if (!w || !h) throw new Error("no video dimensions");
 
     // Prime the decoder: several browsers paint a BLANK frame from a video that has never
     // played. A muted play (allowed by autoplay policy) then pause populates a real frame.
+    // BOUNDED — a hung play() must never freeze the whole grab (that shows as "no
+    // thumbnail, no note"); seeking alone often still yields a frame.
+    stage = "prime";
     try {
-      await video.play();
-      video.pause();
+      await Promise.race([
+        video.play().then(() => video.pause()),
+        new Promise<void>((_, rej) => setTimeout(() => rej(new Error("play timeout")), 3_000)),
+      ]);
     } catch {
-      // Muted autoplay can still be blocked; the seek below often suffices on its own.
+      // priming failed/timed out — fall through to the seek.
     }
 
     const duration = Number.isFinite(video.duration) ? video.duration : 0;
     // A quarter in (capped at ~2s) dodges the black/blank opening frame; always a positive
     // offset so `seeked` actually fires (seeking to 0 while at 0 does not).
     const seekTo = duration > 0 ? Math.min(duration * 0.25, 2) : 0.5;
-    const seeked = waitFor("seeked", 15_000);
+    stage = "seek";
+    const seeked = waitFor("seeked", 8_000);
     video.currentTime = seekTo;
     await seeked;
 
@@ -375,6 +385,7 @@ async function extractVideoFrameFile(
       });
     }
 
+    stage = "draw";
     const scale = Math.min(1, MAX_IMAGE_DIM / Math.max(w, h));
     const cw = Math.max(1, Math.round(w * scale));
     const ch = Math.max(1, Math.round(h * scale));
@@ -386,6 +397,7 @@ async function extractVideoFrameFile(
     // Same-origin object URL, so the canvas is not tainted; toDataURL would throw (caught
     // below) if the draw were ever blocked.
     ctx.drawImage(video, 0, 0, cw, ch);
+    stage = "encode";
     const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
     if (!dataUrl.startsWith("data:image/jpeg") || dataUrl.length < 100) {
       throw new Error("empty frame");
@@ -394,14 +406,14 @@ async function extractVideoFrameFile(
     const frameFile = new File([blob], "video-frame.jpg", { type: "image/jpeg" });
     // Prime the encode cache so Generate Copy / create reuse the frame verbatim.
     encodedImageCache.set(frameFile, Promise.resolve(dataUrl));
-    return { file: frameFile, url: dataUrl, width: cw, height: ch };
+    return { ok: true, file: frameFile, url: dataUrl, width: cw, height: ch };
   } catch (err) {
     // eslint-disable-next-line no-console
     console.warn(
-      "[thumb] could not extract a video frame:",
+      `[thumb] frame extraction failed at ${stage}:`,
       err instanceof Error ? err.message : err,
     );
-    return null;
+    return { ok: false, stage };
   } finally {
     URL.revokeObjectURL(objectUrl);
     video.remove();
@@ -1453,9 +1465,9 @@ export default function DuplicateModal({
         setAutoThumbErr(null);
         const frame = await extractVideoFrameFile(file);
         if (videoGenRef.current[key] !== gen) return;
-        if (!frame) {
+        if (!frame.ok) {
           setAutoThumbErr(
-            "Couldn't read a still frame from this video in your browser — drop a thumbnail image below to continue.",
+            `Couldn't auto-make a thumbnail from this video (stopped at "${frame.stage}"). Drop a thumbnail image below to continue.`,
           );
           return;
         }
