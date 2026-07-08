@@ -292,8 +292,14 @@ function encodeImageFile(file: File): Promise<string> {
  * Grab a representative still frame from a video File, client-side, as a downscaled JPEG
  * (same longest-side cap as uploaded images). Used to AUTO-FILL the required square
  * thumbnail — and give Generate Copy something to read — so a video ad needs no separate
- * image upload. Returns null if the browser can't decode/seek the file (the caller then
- * just leaves the manual thumbnail slot open). Never throws.
+ * image upload. Returns null (and console.warns the reason) if the browser can't
+ * decode/seek/paint the file; the caller then leaves the manual thumbnail slot open and
+ * shows a note. Never throws.
+ *
+ * Robustness notes: several engines won't decode or paint a frame from a fully-detached,
+ * never-played <video>, so we (1) attach it off-screen, (2) prime the decoder with a muted
+ * play/pause, and (3) wait for an actually-presented frame via requestVideoFrameCallback
+ * where available before drawing.
  */
 async function extractVideoFrameFile(
   file: File,
@@ -303,41 +309,72 @@ async function extractVideoFrameFile(
   video.muted = true;
   video.playsInline = true;
   video.preload = "auto";
-  const settle = (
-    resolve: () => void,
-    reject: (e: Error) => void,
-    event: "onloadedmetadata" | "onseeked",
-    label: string,
-  ) => {
-    const to = setTimeout(() => reject(new Error(`${label} timeout`)), 15_000);
-    video[event] = () => {
-      clearTimeout(to);
-      resolve();
-    };
-    video.onerror = () => {
-      clearTimeout(to);
-      reject(new Error(`${label} error`));
-    };
-  };
+  video.style.cssText =
+    "position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;pointer-events:none";
+
+  const waitFor = (event: string, ms: number): Promise<void> =>
+    new Promise<void>((resolve, reject) => {
+      const to = setTimeout(() => {
+        cleanup();
+        reject(new Error(`${event} timeout`));
+      }, ms);
+      const ok = () => {
+        cleanup();
+        resolve();
+      };
+      const bad = () => {
+        cleanup();
+        reject(new Error(`${event} failed`));
+      };
+      const cleanup = () => {
+        clearTimeout(to);
+        video.removeEventListener(event, ok);
+        video.removeEventListener("error", bad);
+      };
+      video.addEventListener(event, ok, { once: true });
+      video.addEventListener("error", bad, { once: true });
+    });
+
   try {
+    document.body.appendChild(video);
     video.src = objectUrl;
-    await new Promise<void>((res, rej) => settle(res, rej, "onloadedmetadata", "metadata"));
+    await waitFor("loadedmetadata", 15_000);
     const w = video.videoWidth;
     const h = video.videoHeight;
-    if (!w || !h) return null;
+    if (!w || !h) throw new Error("no video dimensions");
+
+    // Prime the decoder: several browsers paint a BLANK frame from a video that has never
+    // played. A muted play (allowed by autoplay policy) then pause populates a real frame.
+    try {
+      await video.play();
+      video.pause();
+    } catch {
+      // Muted autoplay can still be blocked; the seek below often suffices on its own.
+    }
+
     const duration = Number.isFinite(video.duration) ? video.duration : 0;
-    // A quarter in (capped at ~2s) dodges the black/blank opening frame most clips have.
-    // Always a positive offset: seeking to 0 when currentTime is already 0 fires no
-    // `seeked` event, which would stall to the timeout. 0.5s is the unknown-duration guess.
+    // A quarter in (capped at ~2s) dodges the black/blank opening frame; always a positive
+    // offset so `seeked` actually fires (seeking to 0 while at 0 does not).
     const seekTo = duration > 0 ? Math.min(duration * 0.25, 2) : 0.5;
-    await new Promise<void>((res, rej) => {
-      settle(res, rej, "onseeked", "seek");
-      try {
-        video.currentTime = seekTo;
-      } catch {
-        rej(new Error("seek unsupported"));
-      }
-    });
+    const seeked = waitFor("seeked", 15_000);
+    video.currentTime = seekTo;
+    await seeked;
+
+    // Wait until a frame is actually presented, where supported — `seeked` can fire a beat
+    // before the frame is paintable.
+    const rvfc = (
+      video as unknown as { requestVideoFrameCallback?: (cb: () => void) => number }
+    ).requestVideoFrameCallback;
+    if (typeof rvfc === "function") {
+      await new Promise<void>((resolve) => {
+        const t = setTimeout(resolve, 800);
+        rvfc.call(video, () => {
+          clearTimeout(t);
+          resolve();
+        });
+      });
+    }
+
     const scale = Math.min(1, MAX_IMAGE_DIM / Math.max(w, h));
     const cw = Math.max(1, Math.round(w * scale));
     const ch = Math.max(1, Math.round(h * scale));
@@ -345,23 +382,35 @@ async function extractVideoFrameFile(
     canvas.width = cw;
     canvas.height = ch;
     const ctx = canvas.getContext("2d");
-    if (!ctx) return null;
+    if (!ctx) throw new Error("no 2d context");
     // Same-origin object URL, so the canvas is not tainted; toDataURL would throw (caught
     // below) if the draw were ever blocked.
     ctx.drawImage(video, 0, 0, cw, ch);
     const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
-    if (!dataUrl.startsWith("data:image/jpeg") || dataUrl.length < 100) return null;
+    if (!dataUrl.startsWith("data:image/jpeg") || dataUrl.length < 100) {
+      throw new Error("empty frame");
+    }
     const blob = await (await fetch(dataUrl)).blob();
     const frameFile = new File([blob], "video-frame.jpg", { type: "image/jpeg" });
     // Prime the encode cache so Generate Copy / create reuse the frame verbatim.
     encodedImageCache.set(frameFile, Promise.resolve(dataUrl));
     return { file: frameFile, url: dataUrl, width: cw, height: ch };
-  } catch {
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[thumb] could not extract a video frame:",
+      err instanceof Error ? err.message : err,
+    );
     return null;
   } finally {
     URL.revokeObjectURL(objectUrl);
+    video.remove();
     video.removeAttribute("src");
-    video.load();
+    try {
+      video.load();
+    } catch {
+      /* ignore */
+    }
   }
 }
 
@@ -981,6 +1030,9 @@ export default function DuplicateModal({
   // Generate Copy (Anthropic) state.
   const [generating, setGenerating] = useState(false);
   const [genError, setGenError] = useState<string | null>(null);
+  // Set when auto-deriving a thumbnail from a picked video's frame failed, so the operator
+  // isn't left staring at an empty thumbnail with no explanation.
+  const [autoThumbErr, setAutoThumbErr] = useState<string | null>(null);
 
   // Live create (write) state. idle → confirm → creating.
   const [phase, setPhase] = useState<"idle" | "creating">("idle");
@@ -1398,8 +1450,15 @@ export default function DuplicateModal({
       // image to read). Never clobbers a thumbnail the operator uploaded; the square
       // slot's own frame is preferred over a non-square slot's.
       void (async () => {
+        setAutoThumbErr(null);
         const frame = await extractVideoFrameFile(file);
-        if (!frame || videoGenRef.current[key] !== gen) return;
+        if (videoGenRef.current[key] !== gen) return;
+        if (!frame) {
+          setAutoThumbErr(
+            "Couldn't read a still frame from this video in your browser — drop a thumbnail image below to continue.",
+          );
+          return;
+        }
         setImages((prev) => {
           const cur = prev.square;
           if (cur && !cur.autoFrom) return prev; // operator's own upload always wins
@@ -1889,6 +1948,12 @@ export default function DuplicateModal({
                 ))}
               </div>
             )}
+
+            {autoThumbErr && !images.square ? (
+              <p className="text-fas-11 text-status-mismatch" role="status">
+                {autoThumbErr}
+              </p>
+            ) : null}
 
             {/* ✨ Generate Copy — suppressed (dimmed) until an image is uploaded. */}
             <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
