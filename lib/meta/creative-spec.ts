@@ -621,12 +621,29 @@ function sanitizeVideoData(vd: Record<string, unknown>): Record<string, unknown>
 }
 
 /**
+ * The source ad's OWN Instagram identity — modern `instagram_user_id`, or the legacy
+ * `instagram_actor_id` — read from its object_story_spec. Used as a fallback when the
+ * destination store didn't resolve an IG id of its own: the clone lands on the SAME Page
+ * as the source, so the source ad's IG account is the faithful identity to advertise as.
+ * Load-bearing for video `asset_feed_spec`, which Meta won't serve on Instagram without an
+ * explicit id (it does NOT auto-apply Page representation — error 100/1772103).
+ */
+export function sourceInstagramId(source: DuplicateSourceCreative): string | null {
+  const oss = source.objectStorySpec;
+  if (!oss) return null;
+  const id = oss.instagram_user_id ?? oss.instagram_actor_id;
+  return typeof id === "string" && id.length > 0 ? id : null;
+}
+
+/**
  * Build fresh `POST .../adcreatives` params for DUPLICATE mode. Starts from a deep
- * clone of the SOURCE ad's own creative, rebinds the page/IG identity to the
- * DESTINATION store's own (freshly resolved — never trusted from the old creative,
- * in case the store's page changed since), and patches in only the copy/link/CTA
- * fields — and per-aspect video slots (`videoOverrides`) — the operator explicitly
- * overrode.
+ * clone of the SOURCE ad's own creative, rebinds the page to the DESTINATION store's, and
+ * patches in only the copy/link/CTA fields — and per-aspect video slots (`videoOverrides`)
+ * — the operator explicitly overrode.
+ *
+ * Instagram identity resolves with a fallback chain: the caller's `instagramUserId` (the
+ * store's own, freshly resolved) wins; otherwise the SOURCE ad's own IG id is carried over
+ * (same Page, and required for video to serve on Instagram) rather than dropped.
  */
 export function buildDuplicateCreativeParams(args: {
   pageId: string;
@@ -642,6 +659,11 @@ export function buildDuplicateCreativeParams(args: {
   if (!args.source.objectStorySpec && !args.source.assetFeedSpec) {
     throw new Error("The source ad has no readable creative to duplicate.");
   }
+
+  // Prefer the store's own resolved IG identity; else keep the source ad's own (the clone
+  // is on the same Page, so it's valid — and video creatives need an explicit id to serve
+  // on Instagram). null only when neither exists.
+  const igId = instagramUserId ?? sourceInstagramId(args.source);
 
   const source =
     args.videoOverrides && args.videoOverrides.length > 0
@@ -659,7 +681,7 @@ export function buildDuplicateCreativeParams(args: {
     if (overrides.link) afs.link_urls = [{ website_url: overrides.link }];
     if (overrides.cta) afs.call_to_action_types = [overrides.cta];
     const identity: Record<string, unknown> = { page_id: pageId };
-    if (instagramUserId) identity.instagram_user_id = instagramUserId;
+    if (igId) identity.instagram_user_id = igId;
     // Read-back JSON isn't a valid write body — strip output-only contamination (asset
     // ids, adlabels/video_label id+created_time, age-expanded customization_spec, signed
     // thumbnail urls) from any VIDEO spec before POSTing. Image asset feeds (no videos[])
@@ -672,9 +694,11 @@ export function buildDuplicateCreativeParams(args: {
   }
 
   const oss = cloneJson(source.objectStorySpec!);
-  // Rebind identity fresh — never trust the (possibly stale) source creative's own.
+  // Rebind the Page to the destination; set the resolved IG id (store's own, else the
+  // source's own carried over). Drop the legacy instagram_actor_id so we never emit both.
   oss.page_id = pageId;
-  if (instagramUserId) oss.instagram_user_id = instagramUserId;
+  delete oss.instagram_actor_id;
+  if (igId) oss.instagram_user_id = igId;
   else delete oss.instagram_user_id;
 
   if (oss.video_data) {

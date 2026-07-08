@@ -29,6 +29,7 @@ export {
   buildCreativeParams,
   buildVideoAssetRules,
   buildDuplicateCreativeParams,
+  sourceInstagramId,
 } from "@/lib/meta/creative-spec";
 export type {
   CreativeInput,

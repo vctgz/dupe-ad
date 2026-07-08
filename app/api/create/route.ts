@@ -47,6 +47,7 @@ import {
   getVideoStatus,
   pickAdsetFromList,
   resolveTrackingPixelId,
+  sourceInstagramId,
   uploadImage,
   type CarouselCardSpec,
   type CreativeContent,
@@ -402,6 +403,13 @@ export async function POST(
     if (r.campaignId) byId.set(r.campaignId, r);
   }
 
+  // Account-wide Instagram identity fallback. A store's own row may not resolve an IG id
+  // (its campaign's template ad had none), yet video asset_feed_spec creatives REQUIRE an
+  // explicit instagram_user_id to serve on Instagram (error 100/1772103). Every store here
+  // advertises as the same brand IG, so any campaign that DID resolve one gives the id to
+  // reuse — no extra Graph calls, just the discovery data we already hold.
+  const accountInstagramId = discovery.rows.find((r) => r.instagramUserId)?.instagramUserId ?? null;
+
   // Per-store landing pages from the mapping CSV's `url` column. When a store has
   // one, its ad links there; otherwise it falls back to the single Destination URL
   // from the modal (already validated as http(s) above).
@@ -643,7 +651,10 @@ export async function POST(
         }
         creativeParams = buildDuplicateCreativeParams({
           pageId,
-          instagramUserId: row?.instagramUserId ?? null,
+          // Store's own IG, else the exact source ad's own (same Page), else the
+          // account-wide brand IG — so a video clone always has an id to serve on Instagram.
+          instagramUserId:
+            row?.instagramUserId ?? sourceInstagramId(found) ?? accountInstagramId,
           source: found,
           overrides: {
             adName,
@@ -671,7 +682,9 @@ export async function POST(
         }
         creativeParams = buildCreativeParams({
           pageId,
-          instagramUserId: row?.instagramUserId ?? null,
+          // Fall back to the account-wide brand IG so a fresh video ad can serve on
+          // Instagram even when this store's own row didn't resolve an IG id.
+          instagramUserId: row?.instagramUserId ?? accountInstagramId,
           content: content!,
           creative: { adName, ...creative, link },
         });

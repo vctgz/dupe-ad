@@ -12,6 +12,7 @@ import {
   buildVideoAssetRules,
   buildCreativeParams,
   buildDuplicateCreativeParams,
+  sourceInstagramId,
   type VideoPlacementKey,
   type CreativeContent,
   type CreativeInput,
@@ -342,7 +343,9 @@ test("duplicate: single video_data — link override updates CTA value but keeps
   });
 });
 
-test("duplicate: missing instagramUserId strips a stale instagram_user_id from the clone", () => {
+test("duplicate: no store IG resolved carries over the SOURCE ad's own instagram_user_id", () => {
+  // Same Page as the source, so its IG account is the faithful identity — and video needs
+  // an explicit one to serve on Instagram (error 100/1772103). Do NOT drop it.
   const source: DuplicateSourceCreative = {
     objectStorySpec: {
       page_id: "PAGE_SOURCE",
@@ -357,7 +360,91 @@ test("duplicate: missing instagramUserId strips a stale instagram_user_id from t
     source,
     overrides: { adName: "Spring Sale" },
   }) as any;
+  assert.equal(params.object_story_spec.instagram_user_id, "IG_SOURCE");
+  assert.equal(params.object_story_spec.page_id, "PAGE_DEST"); // Page still rebound
+});
+
+test("duplicate: with NO IG anywhere, object_story_spec carries no instagram_user_id", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: { page_id: "PAGE_SOURCE", video_data: { video_id: "V1", image_hash: "THUMB" } },
+    assetFeedSpec: null,
+  };
+  const params = buildDuplicateCreativeParams({
+    pageId: "PAGE_DEST",
+    instagramUserId: null,
+    source,
+    overrides: { adName: "Spring Sale" },
+  }) as any;
   assert.equal("instagram_user_id" in params.object_story_spec, false);
+});
+
+test("duplicate: an explicit store instagramUserId wins over the source ad's own", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: {
+      page_id: "PAGE_SOURCE",
+      instagram_user_id: "IG_SOURCE",
+      video_data: { video_id: "V1", image_hash: "THUMB" },
+    },
+    assetFeedSpec: null,
+  };
+  const params = buildDuplicateCreativeParams({
+    pageId: "PAGE_DEST",
+    instagramUserId: "IG_STORE",
+    source,
+    overrides: { adName: "Spring Sale" },
+  }) as any;
+  assert.equal(params.object_story_spec.instagram_user_id, "IG_STORE");
+});
+
+test("duplicate: legacy instagram_actor_id is carried over as instagram_user_id (and not both)", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: {
+      page_id: "PAGE_SOURCE",
+      instagram_actor_id: "IG_LEGACY",
+      video_data: { video_id: "V1", image_hash: "THUMB" },
+    },
+    assetFeedSpec: null,
+  };
+  const params = buildDuplicateCreativeParams({
+    pageId: "PAGE_DEST",
+    instagramUserId: null,
+    source,
+    overrides: { adName: "Spring Sale" },
+  }) as any;
+  assert.equal(params.object_story_spec.instagram_user_id, "IG_LEGACY");
+  assert.equal("instagram_actor_id" in params.object_story_spec, false);
+});
+
+test("duplicate: asset_feed_spec source carries its own IG id into the identity when store has none", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: { page_id: "PAGE_SOURCE", instagram_user_id: "IG_SOURCE" },
+    assetFeedSpec: {
+      videos: [{ video_id: "V_SQ", thumbnail_hash: "T", adlabels: [{ name: "VID_SQUARE" }] }],
+      call_to_action_types: ["SHOP_NOW"],
+    },
+  };
+  const params = buildDuplicateCreativeParams({
+    pageId: "PAGE_DEST",
+    instagramUserId: null,
+    source,
+    overrides: { adName: "Spring Sale" },
+  }) as any;
+  // The identity-only story spec still gets the source's IG id — the video asset feed
+  // cannot serve on Instagram without it.
+  assert.deepEqual(params.object_story_spec, { page_id: "PAGE_DEST", instagram_user_id: "IG_SOURCE" });
+});
+
+test("sourceInstagramId: prefers instagram_user_id, falls back to instagram_actor_id, else null", () => {
+  assert.equal(
+    sourceInstagramId({ objectStorySpec: { instagram_user_id: "A", instagram_actor_id: "B" }, assetFeedSpec: null }),
+    "A",
+  );
+  assert.equal(
+    sourceInstagramId({ objectStorySpec: { instagram_actor_id: "B" }, assetFeedSpec: null }),
+    "B",
+  );
+  assert.equal(sourceInstagramId({ objectStorySpec: { page_id: "P" }, assetFeedSpec: null }), null);
+  assert.equal(sourceInstagramId({ objectStorySpec: null, assetFeedSpec: {} }), null);
 });
 
 test("duplicate: single image (link_data, no child_attachments) — headline/subheadline map to name/description", () => {
