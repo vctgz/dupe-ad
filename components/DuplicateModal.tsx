@@ -138,6 +138,9 @@ interface ImageState {
   ratio: number;
   ok: boolean;
   matchedName: string | null;
+  /** Set to the video slot key when this thumbnail was auto-derived from a video frame
+   *  (so a video ad needs no separate image); absent when the operator uploaded it. */
+  autoFrom?: VideoSlot["key"];
 }
 
 /** What the ad displays. Mirrors the create route's `format` field. */
@@ -283,6 +286,83 @@ function encodeImageFile(file: File): Promise<string> {
   })();
   encodedImageCache.set(file, job);
   return job;
+}
+
+/**
+ * Grab a representative still frame from a video File, client-side, as a downscaled JPEG
+ * (same longest-side cap as uploaded images). Used to AUTO-FILL the required square
+ * thumbnail — and give Generate Copy something to read — so a video ad needs no separate
+ * image upload. Returns null if the browser can't decode/seek the file (the caller then
+ * just leaves the manual thumbnail slot open). Never throws.
+ */
+async function extractVideoFrameFile(
+  file: File,
+): Promise<{ file: File; url: string; width: number; height: number } | null> {
+  const objectUrl = URL.createObjectURL(file);
+  const video = document.createElement("video");
+  video.muted = true;
+  video.playsInline = true;
+  video.preload = "auto";
+  const settle = (
+    resolve: () => void,
+    reject: (e: Error) => void,
+    event: "onloadedmetadata" | "onseeked",
+    label: string,
+  ) => {
+    const to = setTimeout(() => reject(new Error(`${label} timeout`)), 15_000);
+    video[event] = () => {
+      clearTimeout(to);
+      resolve();
+    };
+    video.onerror = () => {
+      clearTimeout(to);
+      reject(new Error(`${label} error`));
+    };
+  };
+  try {
+    video.src = objectUrl;
+    await new Promise<void>((res, rej) => settle(res, rej, "onloadedmetadata", "metadata"));
+    const w = video.videoWidth;
+    const h = video.videoHeight;
+    if (!w || !h) return null;
+    const duration = Number.isFinite(video.duration) ? video.duration : 0;
+    // A quarter in (capped at ~2s) dodges the black/blank opening frame most clips have.
+    // Always a positive offset: seeking to 0 when currentTime is already 0 fires no
+    // `seeked` event, which would stall to the timeout. 0.5s is the unknown-duration guess.
+    const seekTo = duration > 0 ? Math.min(duration * 0.25, 2) : 0.5;
+    await new Promise<void>((res, rej) => {
+      settle(res, rej, "onseeked", "seek");
+      try {
+        video.currentTime = seekTo;
+      } catch {
+        rej(new Error("seek unsupported"));
+      }
+    });
+    const scale = Math.min(1, MAX_IMAGE_DIM / Math.max(w, h));
+    const cw = Math.max(1, Math.round(w * scale));
+    const ch = Math.max(1, Math.round(h * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = cw;
+    canvas.height = ch;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+    // Same-origin object URL, so the canvas is not tainted; toDataURL would throw (caught
+    // below) if the draw were ever blocked.
+    ctx.drawImage(video, 0, 0, cw, ch);
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
+    if (!dataUrl.startsWith("data:image/jpeg") || dataUrl.length < 100) return null;
+    const blob = await (await fetch(dataUrl)).blob();
+    const frameFile = new File([blob], "video-frame.jpg", { type: "image/jpeg" });
+    // Prime the encode cache so Generate Copy / create reuse the frame verbatim.
+    encodedImageCache.set(frameFile, Promise.resolve(dataUrl));
+    return { file: frameFile, url: dataUrl, width: cw, height: ch };
+  } catch {
+    return null;
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+    video.removeAttribute("src");
+    video.load();
+  }
 }
 
 function Dropzone({
@@ -1051,6 +1131,14 @@ export default function DuplicateModal({
       delete next[key];
       return next;
     });
+    // Drop the auto-derived thumbnail if it came from THIS video (a manual upload, with no
+    // autoFrom, stays put). The frame's url is a data: URL, so there's nothing to revoke.
+    setImages((prev) => {
+      if (prev.square?.autoFrom !== key) return prev;
+      const next = { ...prev };
+      delete next.square;
+      return next;
+    });
   }, []);
 
   // ── Carousel card handlers ──────────────────────────────────────────────────
@@ -1303,6 +1391,34 @@ export default function DuplicateModal({
             error: err instanceof Error ? err.message : "Video upload failed",
           }));
         }
+      })();
+
+      // In parallel with the upload: derive the square thumbnail from a frame of this
+      // video, so a video ad needs no separate image upload (and Generate Copy has an
+      // image to read). Never clobbers a thumbnail the operator uploaded; the square
+      // slot's own frame is preferred over a non-square slot's.
+      void (async () => {
+        const frame = await extractVideoFrameFile(file);
+        if (!frame || videoGenRef.current[key] !== gen) return;
+        setImages((prev) => {
+          const cur = prev.square;
+          if (cur && !cur.autoFrom) return prev; // operator's own upload always wins
+          if (cur?.autoFrom === "square" && key !== "square") return prev; // keep square-derived
+          return {
+            ...prev,
+            square: {
+              url: frame.url,
+              file: frame.file,
+              fileName: frame.file.name,
+              width: frame.width,
+              height: frame.height,
+              ratio: frame.height > 0 ? frame.width / frame.height : 1,
+              ok: true,
+              matchedName: null,
+              autoFrom: key,
+            },
+          };
+        });
       })();
     },
     [accountSlug],
@@ -1668,7 +1784,8 @@ export default function DuplicateModal({
                 </div>
                 <p className="text-fas-11 text-ink-muted">
                   Upload up to three ratios — each placement (feed, Stories/Reels, in-stream)
-                  serves its matching video. One is enough to start; the thumbnail is required.
+                  serves its matching video. One is enough to start; the thumbnail is required —
+                  it auto-fills from your video&apos;s first frame, or drop your own to replace it.
                 </p>
               </>
             ) : isCarousel ? (
@@ -1779,7 +1896,13 @@ export default function DuplicateModal({
                 type="button"
                 onClick={generateCopy}
                 disabled={!hasGenSource || generating}
-                title={hasGenSource ? undefined : "Upload an image to generate copy"}
+                title={
+                  hasGenSource
+                    ? undefined
+                    : isVideo
+                      ? "Add a video (its frame becomes the thumbnail) or upload one to generate copy"
+                      : "Upload an image to generate copy"
+                }
                 className={[
                   "fas-focus inline-flex items-center gap-2 rounded-fas-pill border px-3.5 py-1.5 text-fas-13 font-semibold transition-all duration-[110ms] ease-fas",
                   hasGenSource && !generating
@@ -1797,7 +1920,9 @@ export default function DuplicateModal({
               <span className="text-fas-11 text-ink-muted">
                 {hasGenSource
                   ? "Powered by Anthropic — fills the copy fields from your image. Edit anything after."
-                  : "Upload an image to generate copy with AI."}
+                  : isVideo
+                    ? "Add a video — its first frame becomes the thumbnail and feeds the copy — or upload your own."
+                    : "Upload an image to generate copy with AI."}
               </span>
             </div>
             {genError ? (
