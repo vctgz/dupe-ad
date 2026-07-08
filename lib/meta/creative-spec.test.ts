@@ -12,6 +12,8 @@ import {
   buildVideoAssetRules,
   buildCreativeParams,
   buildDuplicateCreativeParams,
+  instagramIdFromCampaignAds,
+  sourceHasVideo,
   sourceInstagramId,
   type VideoPlacementKey,
   type CreativeContent,
@@ -950,4 +952,50 @@ test("H2: single video_data with blank copy rebuilt multi-ratio omits empty text
   assert.equal("titles" in afs, false);
   assert.equal("descriptions" in afs, false);
   assert.ok(!JSON.stringify(afs).includes('"text":""'), "an empty {text:''} slipped through");
+});
+
+// ── instagramIdFromCampaignAds / sourceHasVideo (multi-IG accounts, 100/1772103) ─────
+
+test("instagramIdFromCampaignAds: first IG-carrying ad wins; ads without one are skipped", () => {
+  const ig = instagramIdFromCampaignAds([
+    { creative: { object_story_spec: { page_id: "P" } } } as any,
+    {},
+    { creative: { object_story_spec: { instagram_user_id: "17841444138053286" } } },
+    { creative: { object_story_spec: { instagram_user_id: "OTHER" } } },
+  ]);
+  assert.equal(ig, "17841444138053286");
+});
+
+test("instagramIdFromCampaignAds: legacy instagram_actor_id counts; empty strings do not", () => {
+  assert.equal(
+    instagramIdFromCampaignAds([
+      { creative: { object_story_spec: { instagram_user_id: "" } } },
+      { creative: { object_story_spec: { instagram_actor_id: "LEGACY" } } },
+    ]),
+    "LEGACY",
+  );
+  assert.equal(instagramIdFromCampaignAds([]), null);
+  assert.equal(instagramIdFromCampaignAds([{ creative: {} }, {}]), null);
+});
+
+test("sourceHasVideo: video_data or asset_feed_spec videos → true; image shapes → false", () => {
+  assert.equal(
+    sourceHasVideo({ objectStorySpec: { video_data: { video_id: "V" } }, assetFeedSpec: null }),
+    true,
+  );
+  assert.equal(
+    sourceHasVideo({ objectStorySpec: null, assetFeedSpec: { videos: [{ video_id: "V" }] } }),
+    true,
+  );
+  assert.equal(
+    sourceHasVideo({ objectStorySpec: null, assetFeedSpec: { videos: [] } }),
+    false,
+  );
+  assert.equal(
+    sourceHasVideo({
+      objectStorySpec: { link_data: { image_hash: "H" } },
+      assetFeedSpec: null,
+    }),
+    false,
+  );
 });

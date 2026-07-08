@@ -636,6 +636,45 @@ export function sourceInstagramId(source: DuplicateSourceCreative): string | nul
 }
 
 /**
+ * Whether a duplicate source creative serves video — single-video `video_data` or a
+ * multi-ratio `asset_feed_spec` with video entries. Only these need an explicit
+ * Instagram identity (Meta auto-applies Page representation for image shapes but
+ * refuses video asset feeds without one — error 100/1772103).
+ */
+export function sourceHasVideo(source: DuplicateSourceCreative): boolean {
+  if (source.objectStorySpec?.video_data) return true;
+  const videos = (source.assetFeedSpec as { videos?: unknown[] } | null)?.videos;
+  return Array.isArray(videos) && videos.length > 0;
+}
+
+/** The minimal ad shape `instagramIdFromCampaignAds` inspects. */
+export interface CampaignAdIgSlice {
+  creative?: {
+    object_story_spec?: {
+      instagram_user_id?: string;
+      instagram_actor_id?: string;
+    };
+  };
+}
+
+/**
+ * The campaign's OWN Instagram identity: the first `instagram_user_id` (or legacy
+ * `instagram_actor_id`) carried by any of its existing ads. On multi-IG accounts —
+ * every store Page linked to its own IG account — the campaign's ad history is the
+ * only per-store record of that identity when discovery resolved none (no
+ * Template-named ads to read it from). Preferring the store's own campaign over any
+ * account-wide id also keeps a store from advertising under another store's IG.
+ */
+export function instagramIdFromCampaignAds(ads: CampaignAdIgSlice[]): string | null {
+  for (const ad of ads) {
+    const oss = ad.creative?.object_story_spec;
+    const id = oss?.instagram_user_id ?? oss?.instagram_actor_id;
+    if (typeof id === "string" && id.length > 0) return id;
+  }
+  return null;
+}
+
+/**
  * Build fresh `POST .../adcreatives` params for DUPLICATE mode. Starts from a deep
  * clone of the SOURCE ad's own creative, rebinds the page to the DESTINATION store's, and
  * patches in only the copy/link/CTA fields — and per-aspect video slots (`videoOverrides`)

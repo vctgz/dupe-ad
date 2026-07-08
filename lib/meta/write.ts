@@ -21,6 +21,7 @@ import { MetaApiError, get, getObject, post, postBatch } from "@/lib/meta/client
 import { kvGet, kvSet } from "@/lib/kv";
 import type { AdAccount } from "@/config/accounts";
 import type { DuplicateSourceCreative } from "@/lib/meta/creative-spec";
+import { instagramIdFromCampaignAds } from "@/lib/meta/creative-spec";
 
 // Creative-shape builders + their types live in the pure (server-only-free) module so
 // they can be unit-tested in isolation. Re-exported here so existing importers keep
@@ -29,6 +30,7 @@ export {
   buildCreativeParams,
   buildVideoAssetRules,
   buildDuplicateCreativeParams,
+  sourceHasVideo,
   sourceInstagramId,
 } from "@/lib/meta/creative-spec";
 export type {
@@ -261,6 +263,53 @@ export async function findSourceAdCreative(
     objectStorySpec: chosen.creative?.object_story_spec ?? null,
     assetFeedSpec: chosen.creative?.asset_feed_spec ?? null,
   };
+}
+
+interface MetaCampaignIgAd {
+  id: string;
+  creative?: {
+    object_story_spec?: {
+      instagram_user_id?: string;
+      instagram_actor_id?: string;
+    };
+  };
+}
+
+/**
+ * Resolve ONE campaign's own Instagram identity from its existing ads' creatives.
+ * Used when a video write needs an explicit `instagram_user_id` (error 100/1772103)
+ * but discovery resolved none for the store — multi-IG accounts keep each store's
+ * IG only in that store's campaign history. Returns null when no ad carries one.
+ */
+export async function findCampaignInstagramId(
+  token: string,
+  campaignId: string,
+): Promise<string | null> {
+  let ads: MetaCampaignIgAd[] | null = null;
+  let lastErr: unknown;
+  for (const limit of SOURCE_AD_PAGE_SIZES) {
+    try {
+      ads = await get<MetaCampaignIgAd>(
+        `${campaignId}/ads`,
+        {
+          fields: "id,creative{object_story_spec{instagram_user_id,instagram_actor_id}}",
+          limit,
+        },
+        token,
+      );
+      break;
+    } catch (err) {
+      if (err instanceof MetaApiError && err.code === 1) {
+        lastErr = err;
+        // eslint-disable-next-line no-console
+        console.warn(`[meta] ${campaignId}/ads (IG lookup) too large at limit=${limit}; backing off`);
+        continue;
+      }
+      throw err;
+    }
+  }
+  if (ads === null) throw lastErr;
+  return instagramIdFromCampaignAds(ads);
 }
 
 interface MetaPixel {

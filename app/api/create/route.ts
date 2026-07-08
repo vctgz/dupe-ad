@@ -43,10 +43,12 @@ import {
   buildDuplicateCreativeParams,
   createCreativeAndPausedAd,
   fetchAdsetsByCampaign,
+  findCampaignInstagramId,
   findSourceAdCreative,
   getVideoStatus,
   pickAdsetFromList,
   resolveTrackingPixelId,
+  sourceHasVideo,
   sourceInstagramId,
   uploadImage,
   type CarouselCardSpec,
@@ -651,10 +653,19 @@ export async function POST(
         }
         creativeParams = buildDuplicateCreativeParams({
           pageId,
-          // Store's own IG, else the exact source ad's own (same Page), else the
-          // account-wide brand IG — so a video clone always has an id to serve on Instagram.
+          // Store's own IG, else the exact source ad's own (same Page), else any IG an
+          // ad in THIS campaign carries (multi-IG accounts: each store Page has its own
+          // IG account, recorded only in its campaign's ad history), else the
+          // account-wide brand IG — so a video clone always has an id to serve on
+          // Instagram. The campaign lookup is one extra Graph read, spent only when a
+          // video shape needs it and the cheaper sources came up empty.
           instagramUserId:
-            row?.instagramUserId ?? sourceInstagramId(found) ?? accountInstagramId,
+            row?.instagramUserId ??
+            sourceInstagramId(found) ??
+            (videos.length > 0 || sourceHasVideo(found)
+              ? await findCampaignInstagramId(token, campaignId)
+              : null) ??
+            accountInstagramId,
           source: found,
           overrides: {
             adName,
@@ -682,9 +693,15 @@ export async function POST(
         }
         creativeParams = buildCreativeParams({
           pageId,
-          // Fall back to the account-wide brand IG so a fresh video ad can serve on
-          // Instagram even when this store's own row didn't resolve an IG id.
-          instagramUserId: row?.instagramUserId ?? accountInstagramId,
+          // A fresh video ad must carry an IG id to serve on Instagram. When this
+          // store's row didn't resolve one (an account with no Template-named ads
+          // resolves none, ever), read it from the campaign's OWN existing ads first —
+          // on multi-IG accounts the account-wide id is another store's identity, so
+          // it stays the last resort.
+          instagramUserId:
+            row?.instagramUserId ??
+            (format === "video" ? await findCampaignInstagramId(token, campaignId) : null) ??
+            accountInstagramId,
           content: content!,
           creative: { adName, ...creative, link },
         });
