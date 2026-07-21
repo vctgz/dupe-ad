@@ -1024,6 +1024,9 @@ export default function DuplicateModal({
   const [adsetName, setAdsetName] = useState("");
   const [link, setLink] = useState("");
   const [cta, setCta] = useState<string>("");
+  // Duplicate mode only: optional utm_content replacement across the clone's
+  // tracking (url_tags + destination URLs); blank keeps the source ad's own.
+  const [utmContent, setUtmContent] = useState("");
 
   const [images, setImages] = useState<Partial<Record<Placement["key"], ImageState>>>({});
 
@@ -1645,6 +1648,7 @@ export default function DuplicateModal({
         cards: cardPayload,
         adName: adName.trim(),
         newAdName: isCreate ? undefined : newAdName.trim() || undefined,
+        utmContent: isCreate ? undefined : utmContent.trim() || undefined,
         adsetName: adsetName.trim() || undefined,
         creative: {
           primaryText,
@@ -2183,6 +2187,26 @@ export default function DuplicateModal({
               </select>
             </Field>
           </div>
+
+          {/* Duplicate only: replace the utm_content tracking parameter. Input is
+              sanitized live — a UTM value never legitimately contains spaces/&/#,
+              and any of them would corrupt the query string it lands in. */}
+          {!isCreate ? (
+            <Field
+              label="UTM content (optional)"
+              helper="Replaces the utm_content tracking parameter wherever the cloned ad carries it — its URL parameters and url_tags. Blank keeps each store's own tracking as-is."
+              htmlFor="dm-utmcontent"
+            >
+              <input
+                id="dm-utmcontent"
+                type="text"
+                value={utmContent}
+                onChange={(e) => setUtmContent(e.target.value.replace(/[\s&#]/g, ""))}
+                placeholder="e.g. fall_prep_aug26"
+                className="fas-focus w-full rounded-fas-md border border-hairline bg-surface px-3.5 py-2.5 text-fas-14 text-ink placeholder:text-ink-muted"
+              />
+            </Field>
+          ) : null}
 
           {/* Error */}
           {error ? (

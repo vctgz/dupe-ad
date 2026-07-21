@@ -212,6 +212,7 @@ interface MetaSourceAd {
   creative?: {
     object_story_spec?: Record<string, unknown>;
     asset_feed_spec?: Record<string, unknown>;
+    url_tags?: string;
   };
 }
 
@@ -235,7 +236,7 @@ export async function findSourceAdCreative(
       ads = await get<MetaSourceAd>(
         `${campaignId}/ads`,
         {
-          fields: "id,name,effective_status,creative{object_story_spec,asset_feed_spec}",
+          fields: "id,name,effective_status,creative{object_story_spec,asset_feed_spec,url_tags}",
           limit,
           filtering,
         },
@@ -262,6 +263,7 @@ export async function findSourceAdCreative(
   return {
     objectStorySpec: chosen.creative?.object_story_spec ?? null,
     assetFeedSpec: chosen.creative?.asset_feed_spec ?? null,
+    urlTags: chosen.creative?.url_tags ?? null,
   };
 }
 

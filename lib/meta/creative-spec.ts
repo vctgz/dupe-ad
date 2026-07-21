@@ -298,6 +298,9 @@ function cloneJson<T>(value: T): T {
 export interface DuplicateSourceCreative {
   objectStorySpec: Record<string, unknown> | null;
   assetFeedSpec: Record<string, unknown> | null;
+  /** The creative-level url_tags query fragment (Meta's usual home for UTMs);
+   *  carried over onto the clone so tracking survives duplication. */
+  urlTags?: string | null;
 }
 
 /**
@@ -696,6 +699,84 @@ function sanitizeVideoData(vd: Record<string, unknown>): Record<string, unknown>
   return out;
 }
 
+// ── utm_content override ────────────────────────────────────────────────────────
+//
+// A query string on a Meta ad may carry {{...}} URL macros ({{ad.name}},
+// {{campaign.id}}, …). URL/URLSearchParams would percent-encode the braces and
+// break them, so every rewrite here works on raw `k=v` pairs and touches ONLY the
+// utm_content pair — every other byte passes through verbatim.
+
+/** Replace the utm_content pair's value in a raw query fragment ("a=1&b=2"), or
+ *  append one when `addIfMissing`. Everything else is untouched, macros included. */
+function upsertUtmContentPair(query: string, value: string, addIfMissing: boolean): string {
+  const pairs = query.length > 0 ? query.split("&") : [];
+  let found = false;
+  const out = pairs.map((p) => {
+    if (p.split("=", 1)[0] !== "utm_content") return p;
+    found = true;
+    return `utm_content=${value}`;
+  });
+  if (!found) {
+    if (!addIfMissing) return query;
+    out.push(`utm_content=${value}`);
+  }
+  return out.join("&");
+}
+
+/** Set utm_content in a full URL's query (replace, or append when `addIfMissing`),
+ *  preserving the path, every other param in order, any #fragment, and {{macros}}. */
+export function setUtmContentInUrl(url: string, value: string, addIfMissing: boolean): string {
+  const hashIdx = url.indexOf("#");
+  const fragment = hashIdx >= 0 ? url.slice(hashIdx) : "";
+  const base = hashIdx >= 0 ? url.slice(0, hashIdx) : url;
+  const qIdx = base.indexOf("?");
+  if (qIdx < 0) {
+    return addIfMissing ? `${base}?utm_content=${value}${fragment}` : url;
+  }
+  const query = upsertUtmContentPair(base.slice(qIdx + 1), value, addIfMissing);
+  return `${base.slice(0, qIdx)}?${query}${fragment}`;
+}
+
+/** The keys that hold a creative's destination URLs across every shape:
+ *  link_data.link, call_to_action.value.link, child_attachments[].link,
+ *  video_data's CTA link, and asset_feed_spec.link_urls[].website_url. */
+const LINK_KEYS = new Set(["link", "website_url"]);
+
+/** Deep-walk a params tree and rewrite every http(s) destination-URL field. */
+function rewriteLinks(node: unknown, fn: (url: string) => string): void {
+  if (Array.isArray(node)) {
+    for (const item of node) rewriteLinks(item, fn);
+    return;
+  }
+  if (!node || typeof node !== "object") return;
+  for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+    if (LINK_KEYS.has(k) && typeof v === "string" && /^https?:\/\//i.test(v)) {
+      (node as Record<string, unknown>)[k] = fn(v);
+    } else {
+      rewriteLinks(v, fn);
+    }
+  }
+}
+
+/**
+ * Replace utm_content across a built duplicate-creative params body.
+ *
+ * When the creative carries `url_tags` (Meta appends it to the final URL — its
+ * usual home for UTMs), utm_content is set/replaced THERE, and destination links
+ * only have an existing utm_content replaced — never appended, which would
+ * double-tag the final URL. Without url_tags, utm_content is set/replaced on
+ * every destination link directly.
+ */
+export function applyUtmContentOverride(params: Record<string, unknown>, value: string): void {
+  const urlTags = params.url_tags;
+  if (typeof urlTags === "string" && urlTags.length > 0) {
+    params.url_tags = upsertUtmContentPair(urlTags, value, true);
+    rewriteLinks(params, (u) => setUtmContentInUrl(u, value, false));
+  } else {
+    rewriteLinks(params, (u) => setUtmContentInUrl(u, value, true));
+  }
+}
+
 /**
  * The source ad's OWN Instagram identity — modern `instagram_user_id`, or the legacy
  * `instagram_actor_id` — read from its object_story_spec. Used as a fallback when the
@@ -769,9 +850,21 @@ export function buildDuplicateCreativeParams(args: {
   videoOverrides?: VideoPlacement[];
   /** Account-scoped hash replacing the source ad's image; omitted keeps its own. */
   imageOverrideHash?: string | null;
+  /** Replaces utm_content in the clone's tracking (url_tags + destination URLs);
+   *  omitted keeps the source ad's own tracking untouched. */
+  utmContent?: string | null;
 }): Record<string, unknown> {
   const { pageId, instagramUserId, overrides } = args;
   const name = `${overrides.adName} — creative`;
+
+  // Shared tail for both creative shapes: carry the source's url_tags onto the
+  // clone (tracking must survive duplication), then apply the utm_content
+  // override across url_tags + every destination URL.
+  const finalize = (params: Record<string, unknown>): Record<string, unknown> => {
+    if (args.source.urlTags) params.url_tags = args.source.urlTags;
+    if (args.utmContent) applyUtmContentOverride(params, args.utmContent);
+    return params;
+  };
 
   if (!args.source.objectStorySpec && !args.source.assetFeedSpec) {
     throw new Error("The source ad has no readable creative to duplicate.");
@@ -813,7 +906,7 @@ export function buildDuplicateCreativeParams(args: {
       Array.isArray(afs.videos) && (afs.videos as unknown[]).length > 0
         ? sanitizeVideoAssetFeedSpec(afs)
         : afs;
-    return { name, object_story_spec: identity, asset_feed_spec: cleaned };
+    return finalize({ name, object_story_spec: identity, asset_feed_spec: cleaned });
   }
 
   const oss = cloneJson(source.objectStorySpec!);
@@ -862,5 +955,5 @@ export function buildDuplicateCreativeParams(args: {
     }
   }
 
-  return { name, object_story_spec: oss };
+  return finalize({ name, object_story_spec: oss });
 }

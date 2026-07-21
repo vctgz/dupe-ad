@@ -13,6 +13,7 @@ import {
   buildCreativeParams,
   buildDuplicateCreativeParams,
   instagramIdFromCampaignAds,
+  setUtmContentInUrl,
   sourceHasVideo,
   sourceInstagramId,
   type VideoPlacementKey,
@@ -955,6 +956,126 @@ test("H2: single video_data with blank copy rebuilt multi-ratio omits empty text
 });
 
 // ── instagramIdFromCampaignAds / sourceHasVideo (multi-IG accounts, 100/1772103) ─────
+
+// ── utm_content override (duplicate mode) ────────────────────────────────────
+// Meta URLs and url_tags may carry {{...}} macros — every byte except the
+// utm_content pair must survive verbatim (URLSearchParams would encode braces).
+
+test("setUtmContentInUrl: replaces in place — order, other params, macros, fragment kept", () => {
+  assert.equal(
+    setUtmContentInUrl(
+      "https://x.com/p?utm_source=fb&utm_content=old&ad={{ad.name}}#frag",
+      "new",
+      true,
+    ),
+    "https://x.com/p?utm_source=fb&utm_content=new&ad={{ad.name}}#frag",
+  );
+});
+
+test("setUtmContentInUrl: appends when missing (addIfMissing), else leaves untouched", () => {
+  assert.equal(
+    setUtmContentInUrl("https://x.com/p?utm_source=fb", "v", true),
+    "https://x.com/p?utm_source=fb&utm_content=v",
+  );
+  assert.equal(setUtmContentInUrl("https://x.com/p", "v", true), "https://x.com/p?utm_content=v");
+  assert.equal(setUtmContentInUrl("https://x.com/p?a=1", "v", false), "https://x.com/p?a=1");
+});
+
+test("url_tags is read-back-carried onto the clone verbatim when no utmContent is set", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: {
+      page_id: "P",
+      link_data: { link: "https://example.com/x", image_hash: "H" },
+    },
+    assetFeedSpec: null,
+    urlTags: "utm_source=facebook&utm_content={{ad.name}}",
+  };
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source,
+    overrides: { adName: "Fall Prep" },
+  }) as any;
+  assert.equal(params.url_tags, "utm_source=facebook&utm_content={{ad.name}}");
+});
+
+test("utmContent + url_tags: replaced in url_tags; links only replaced where present", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: {
+      page_id: "P",
+      link_data: {
+        // No utm_content here — must NOT get one appended (url_tags governs, and
+        // appending would double-tag the final URL).
+        link: "https://example.com/x?utm_source=fb",
+        image_hash: "H",
+        call_to_action: {
+          type: "SHOP_NOW",
+          // Has one — replaced.
+          value: { link: "https://example.com/x?utm_content=old" },
+        },
+      },
+    },
+    assetFeedSpec: null,
+    urlTags: "utm_source=facebook&utm_medium={{placement}}&utm_content=old",
+  };
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source,
+    overrides: { adName: "Fall Prep" },
+    utmContent: "fall_prep",
+  }) as any;
+  assert.equal(params.url_tags, "utm_source=facebook&utm_medium={{placement}}&utm_content=fall_prep");
+  const ld = params.object_story_spec.link_data;
+  assert.equal(ld.link, "https://example.com/x?utm_source=fb");
+  assert.equal(ld.call_to_action.value.link, "https://example.com/x?utm_content=fall_prep");
+});
+
+test("utmContent without url_tags: set on every destination URL, every shape", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: {
+      page_id: "P",
+      link_data: {
+        link: "https://example.com/x?utm_content=old",
+        image_hash: "H",
+        child_attachments: [
+          { link: "https://example.com/card1", image_hash: "A" },
+          { link: "https://example.com/card2?utm_content=old", image_hash: "B" },
+        ],
+      },
+    },
+    assetFeedSpec: null,
+  };
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source,
+    overrides: { adName: "Fall Prep" },
+    utmContent: "fall_prep",
+  }) as any;
+  const ld = params.object_story_spec.link_data;
+  assert.equal(ld.link, "https://example.com/x?utm_content=fall_prep");
+  assert.equal(ld.child_attachments[0].link, "https://example.com/card1?utm_content=fall_prep");
+  assert.equal(ld.child_attachments[1].link, "https://example.com/card2?utm_content=fall_prep");
+});
+
+test("utmContent applies to asset-feed link_urls and composes with a link override", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: { page_id: "P" },
+    assetFeedSpec: {
+      ad_formats: ["SINGLE_IMAGE"],
+      images: [{ hash: "IMG" }],
+      link_urls: [{ website_url: "https://example.com/old?utm_content=old" }],
+    },
+  };
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source,
+    overrides: { adName: "Fall Prep", link: "https://example.com/fresh" },
+    utmContent: "fall_prep",
+  }) as any;
+  // The typed link override wins, THEN gets the utm_content applied on top.
+  assert.deepEqual(params.asset_feed_spec.link_urls, [
+    { website_url: "https://example.com/fresh?utm_content=fall_prep" },
+  ]);
+});
 
 // ── Image override (duplicate mode) ──────────────────────────────────────────
 // The uploaded image must replace the clone's image everywhere the old one

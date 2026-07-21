@@ -102,6 +102,15 @@ const bodySchema = z
     // Duplicate mode only: the name for the CREATED ads. Blank/omitted keeps the
     // source ad's name — `adName` stays the finder either way.
     newAdName: z.string().trim().max(512).optional(),
+    // Duplicate mode only: replaces utm_content in the clone's tracking (url_tags
+    // and destination URLs). Blank/omitted keeps the source ad's own tracking.
+    // No whitespace / & / # — those would break the query string it lands in.
+    utmContent: z
+      .string()
+      .trim()
+      .max(255)
+      .regex(/^[^\s&#]*$/, "utm_content may not contain spaces, '&', or '#'.")
+      .optional(),
     // Optional: target only ad sets whose name CONTAINS this (case-insensitive) in each
     // campaign. Omitted -> the campaign's active (else first) ad set.
     adsetName: z.string().trim().max(512).optional(),
@@ -725,6 +734,9 @@ export async function POST(
           // Uploaded once above; swaps this clone's image (per-row error on a
           // video/carousel source). null keeps the store's own image.
           imageOverrideHash,
+          // Replaces utm_content across the clone's url_tags + destination URLs;
+          // blank keeps the source ad's own tracking.
+          utmContent: parsed.data.utmContent || undefined,
         });
       } else {
         // Create: this store's landing page wins over the modal's fallback URL. A
