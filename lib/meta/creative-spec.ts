@@ -362,16 +362,16 @@ function applyVideoOverrides(
   source: DuplicateSourceCreative,
   overrides: VideoPlacement[],
 ): DuplicateSourceCreative {
-  if (source.assetFeedSpec) {
+  // Only treat the asset feed as the video carrier when it actually holds videos —
+  // a flexible/enhancement-style feed can be media-less (formats/flags only) with
+  // the real video living in object_story_spec.video_data below.
+  if (
+    source.assetFeedSpec &&
+    Array.isArray(source.assetFeedSpec.videos) &&
+    (source.assetFeedSpec.videos as unknown[]).length > 0
+  ) {
     const afs = cloneJson(source.assetFeedSpec);
-    const entries = Array.isArray(afs.videos)
-      ? (afs.videos as Record<string, unknown>[])
-      : null;
-    if (!entries || entries.length === 0) {
-      throw new Error(
-        "The source ad's creative carries no videos to replace — it may be an image ad.",
-      );
-    }
+    const entries = afs.videos as Record<string, unknown>[];
 
     const allOurs = entries.every((e) => slotOfEntry(e) !== null);
     if (allOurs) {
@@ -482,14 +482,19 @@ function applyVideoOverrides(
  * video-override contract: the uploaded image replaces the cloned ad's image
  * everywhere the old one appeared; no upload keeps the source's own image.
  *
- * How it lands depends on the source's shape:
+ * How it lands depends on the source's shape — the image is replaced EVERYWHERE
+ * it appears, because a flexible/enhancement-style creative can read back with an
+ * asset_feed_spec that carries NO media (formats + enhancement flags only) while
+ * its real image sits in object_story_spec.link_data:
+ *   image asset_feed_spec (images[] present) — every entry's hash replaced in
+ *     place, labels and customization rules untouched.
  *   single-image link_data — image_hash swapped in place (read-back `picture` /
- *     `image_url` variants dropped so the new hash is authoritative).
- *   image asset_feed_spec — every images[] entry's hash replaced in place, labels
- *     and customization rules untouched, so per-placement rules keep resolving.
+ *     `image_url` variants dropped so the new hash is authoritative). Runs even
+ *     when an asset feed is also present but held no images.
  *   video shapes / carousel — throws (surfaced as that store's per-row error):
  *     an image can't replace a video, and one image can't address a carousel's
  *     per-card images.
+ *   neither location holds an image — throws rather than silently keeping the old.
  */
 function applyImageOverride(
   source: DuplicateSourceCreative,
@@ -500,37 +505,42 @@ function applyImageOverride(
       "The source ad is a video ad — an image can't replace its video. Use the video override slots instead.",
     );
   }
-  if (source.assetFeedSpec) {
-    const afs = cloneJson(source.assetFeedSpec);
-    const entries = Array.isArray(afs.images)
-      ? (afs.images as Record<string, unknown>[])
-      : null;
-    if (!entries || entries.length === 0) {
-      throw new Error("The source ad's creative carries no image to replace.");
-    }
-    for (const e of entries) {
+
+  let assetFeedSpec = source.assetFeedSpec;
+  let replacedInFeed = false;
+  const feedImages = source.assetFeedSpec?.images;
+  if (Array.isArray(feedImages) && feedImages.length > 0) {
+    const afs = cloneJson(source.assetFeedSpec!);
+    for (const e of afs.images as Record<string, unknown>[]) {
       e.hash = imageHash;
       delete e.url;
       delete e.url_128;
       delete e.id;
     }
-    return { objectStorySpec: source.objectStorySpec, assetFeedSpec: afs };
+    assetFeedSpec = afs;
+    replacedInFeed = true;
   }
+
+  let objectStorySpec = source.objectStorySpec;
   const ld = source.objectStorySpec?.link_data as Record<string, unknown> | undefined;
-  if (!ld) {
+  if (ld && Array.isArray(ld.child_attachments)) {
+    if (!replacedInFeed) {
+      throw new Error(
+        "The source ad is a carousel — one image can't replace its per-card images. Clear the image override.",
+      );
+    }
+  } else if (ld) {
+    const oss = cloneJson(source.objectStorySpec!);
+    const cloned = oss.link_data as Record<string, unknown>;
+    cloned.image_hash = imageHash;
+    delete cloned.picture;
+    delete cloned.image_url;
+    objectStorySpec = oss;
+  } else if (!replacedInFeed) {
     throw new Error("The source ad's creative carries no image to replace.");
   }
-  if (Array.isArray(ld.child_attachments)) {
-    throw new Error(
-      "The source ad is a carousel — one image can't replace its per-card images. Clear the image override.",
-    );
-  }
-  const oss = cloneJson(source.objectStorySpec!);
-  const cloned = oss.link_data as Record<string, unknown>;
-  cloned.image_hash = imageHash;
-  delete cloned.picture;
-  delete cloned.image_url;
-  return { objectStorySpec: oss, assetFeedSpec: null };
+
+  return { ...source, objectStorySpec, assetFeedSpec };
 }
 
 // ── Read-back → write-safe sanitizers ───────────────────────────────────────────
@@ -652,6 +662,18 @@ function sanitizeVideoAssetFeedSpec(afs: Record<string, unknown>): Record<string
     ).map(cleanRule);
   }
   return out;
+}
+
+/** Whether an asset_feed_spec actually carries creative assets. A flexible /
+ *  Advantage+-enhanced source can read back a feed holding only formats and
+ *  enhancement flags while the real creative sits in object_story_spec — such a
+ *  media-less feed is NOT the creative and must not be cloned as one. */
+function assetFeedHasAssets(afs: Record<string, unknown>): boolean {
+  for (const key of ["images", "videos", "carousels"]) {
+    const v = afs[key];
+    if (Array.isArray(v) && v.length > 0) return true;
+  }
+  return false;
 }
 
 /**
@@ -883,10 +905,17 @@ export function buildDuplicateCreativeParams(args: {
     source = applyVideoOverrides(source, args.videoOverrides);
   }
 
-  // Multi-aspect source (today: our own 1-3 ratio video ads) — reuse the labeled
+  // Asset-feed source (multi-ratio video ads, image feeds) — reuse the labeled
   // asset array + placement rules VERBATIM (account-scoped ids are already valid
-  // here); only the copy/link/CTA arrays get rewritten.
-  if (source.assetFeedSpec) {
+  // here); only the copy/link/CTA arrays get rewritten. A MEDIA-LESS feed
+  // (flexible/enhancement flags only, real creative in object_story_spec) is NOT
+  // the creative: skip to the object_story_spec branch below, which clones the
+  // actual link_data/video_data and drops the enhancement shell — cloning the
+  // shell as the creative would produce an ad with no media at all.
+  if (
+    source.assetFeedSpec &&
+    (assetFeedHasAssets(source.assetFeedSpec) || !source.objectStorySpec)
+  ) {
     const afs = cloneJson(source.assetFeedSpec);
     if (overrides.primaryText) afs.bodies = [{ text: overrides.primaryText }];
     if (overrides.headline) afs.titles = [{ text: overrides.headline }];

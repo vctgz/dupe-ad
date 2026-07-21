@@ -1179,6 +1179,77 @@ test("image override: carousel source throws rather than flattening the cards", 
   );
 });
 
+test("image override: flexible source (asset feed with NO media) lands in link_data", () => {
+  // True Value's flexible/enhancement-style templates: asset_feed_spec reads back
+  // with formats/flags only, while the real image lives in link_data. The override
+  // must fall through to link_data instead of throwing "no image to replace".
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: {
+      page_id: "PAGE_SOURCE",
+      link_data: {
+        message: "Body",
+        link: "https://example.com/x",
+        image_hash: "OLD_HASH",
+        picture: "https://scontent.xx.fbcdn.net/old.jpg",
+      },
+    },
+    assetFeedSpec: {
+      ad_formats: ["SINGLE_IMAGE", "SINGLE_VIDEO"],
+      optimization_type: "DEGREES_OF_FREEDOM",
+    },
+  };
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source,
+    overrides: { adName: "Fall Prep" },
+    imageOverrideHash: "NEW_HASH",
+  }) as any;
+  assert.equal(params.object_story_spec.link_data.image_hash, "NEW_HASH");
+  assert.equal(params.object_story_spec.link_data.picture, undefined);
+  assert.equal(params.object_story_spec.page_id, "PAGE_DEST");
+  // The media-less enhancement shell is dropped — cloning it as the creative
+  // would have produced an ad with no media (identity-only story spec).
+  assert.equal(params.asset_feed_spec, undefined);
+});
+
+test("plain duplicate of a flexible source clones link_data, not the media-less feed", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: {
+      page_id: "PAGE_SOURCE",
+      link_data: { message: "Body", link: "https://example.com/x", image_hash: "OLD_HASH" },
+    },
+    assetFeedSpec: {
+      ad_formats: ["SINGLE_IMAGE", "SINGLE_VIDEO"],
+      optimization_type: "DEGREES_OF_FREEDOM",
+    },
+  };
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source,
+    overrides: { adName: "Fall Prep" },
+  }) as any;
+  assert.equal(params.object_story_spec.link_data.image_hash, "OLD_HASH");
+  assert.equal(params.object_story_spec.page_id, "PAGE_DEST");
+  assert.equal(params.asset_feed_spec, undefined);
+});
+
+test("image override: no image anywhere (media-less feed, no link_data) still throws", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: { page_id: "P" },
+    assetFeedSpec: { ad_formats: ["SINGLE_IMAGE"], optimization_type: "DEGREES_OF_FREEDOM" },
+  };
+  assert.throws(
+    () =>
+      buildDuplicateCreativeParams({
+        ...DEST,
+        source,
+        overrides: { adName: "Fall Prep" },
+        imageOverrideHash: "NEW_HASH",
+      }),
+    /no image to replace/i,
+  );
+});
+
 test("image override: omitted keeps the source image untouched", () => {
   const source: DuplicateSourceCreative = {
     objectStorySpec: {
