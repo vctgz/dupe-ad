@@ -595,6 +595,26 @@ function sanitizeVideoAssetFeedSpec(afs: Record<string, unknown>): Record<string
   return out;
 }
 
+/**
+ * The write endpoint accepts an asset feed with EXACTLY ONE ad format (error
+ * 100/1885374), but read-back of a flexible-format source ad (mixed media built in
+ * Ads Manager) lists every format it can serve, e.g. ["SINGLE_IMAGE","SINGLE_VIDEO"].
+ * Narrow the clone to the one format matching the assets it actually carries:
+ * a video-bearing feed keeps only its videos[] after sanitizing, so SINGLE_VIDEO
+ * wins; an image feed prefers SINGLE_IMAGE, then CAROUSEL; an unrecognized set
+ * keeps its first entry. A single-entry (or absent) ad_formats is left untouched.
+ * Mutates `afs` in place (always called on a fresh clone).
+ */
+export function narrowAdFormats(afs: Record<string, unknown>): void {
+  const formats = afs.ad_formats;
+  if (!Array.isArray(formats) || formats.length <= 1) return;
+  const hasVideos = Array.isArray(afs.videos) && (afs.videos as unknown[]).length > 0;
+  const preference = hasVideos
+    ? ["SINGLE_VIDEO", "CAROUSEL"]
+    : ["SINGLE_IMAGE", "CAROUSEL"];
+  afs.ad_formats = [preference.find((f) => formats.includes(f)) ?? formats[0]];
+}
+
 /** Whitelisted keys of a single-video `video_data` write body. */
 const VIDEO_DATA_KEYS = [
   "video_id",
@@ -719,6 +739,9 @@ export function buildDuplicateCreativeParams(args: {
     if (overrides.subheadline) afs.descriptions = [{ text: overrides.subheadline }];
     if (overrides.link) afs.link_urls = [{ website_url: overrides.link }];
     if (overrides.cta) afs.call_to_action_types = [overrides.cta];
+    // A flexible-format source reads back with multiple ad_formats; the write
+    // endpoint takes exactly one (error 100/1885374) — narrow before POSTing.
+    narrowAdFormats(afs);
     const identity: Record<string, unknown> = { page_id: pageId };
     if (igId) identity.instagram_user_id = igId;
     // Read-back JSON isn't a valid write body — strip output-only contamination (asset

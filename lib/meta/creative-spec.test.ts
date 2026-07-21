@@ -956,6 +956,82 @@ test("H2: single video_data with blank copy rebuilt multi-ratio omits empty text
 
 // ── instagramIdFromCampaignAds / sourceHasVideo (multi-IG accounts, 100/1772103) ─────
 
+// ── Flexible-format sources (error 100/1885374) ──────────────────────────────
+// A source ad built in Ads Manager with mixed media reads back an asset feed
+// listing EVERY format it serves; the write endpoint takes exactly one.
+
+test("flexible source: multi-format VIDEO feed narrows to SINGLE_VIDEO, images dropped", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: { page_id: "PAGE_SOURCE" },
+    assetFeedSpec: {
+      ad_formats: ["SINGLE_IMAGE", "SINGLE_VIDEO"],
+      videos: [{ video_id: "V1", thumbnail_hash: "T" }],
+      images: [{ hash: "IMG1" }],
+      bodies: [{ text: "Body" }],
+    },
+  };
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source,
+    overrides: { adName: "Spring Sale" },
+  }) as any;
+  assert.deepEqual(params.asset_feed_spec.ad_formats, ["SINGLE_VIDEO"]);
+  // Only the video assets survive the sanitize — a SINGLE_VIDEO feed can't carry images.
+  assert.equal(params.asset_feed_spec.images, undefined);
+});
+
+test("flexible source: multi-format IMAGE feed narrows to SINGLE_IMAGE, images kept", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: { page_id: "PAGE_SOURCE" },
+    assetFeedSpec: {
+      ad_formats: ["SINGLE_IMAGE", "CAROUSEL"],
+      images: [{ hash: "IMG1" }],
+      bodies: [{ text: "Body" }],
+    },
+  };
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source,
+    overrides: { adName: "Spring Sale" },
+  }) as any;
+  assert.deepEqual(params.asset_feed_spec.ad_formats, ["SINGLE_IMAGE"]);
+  assert.deepEqual(params.asset_feed_spec.images, [{ hash: "IMG1" }]);
+});
+
+test("single-format ad_formats passes through untouched (video and carousel)", () => {
+  for (const format of ["SINGLE_VIDEO", "CAROUSEL"]) {
+    const source: DuplicateSourceCreative = {
+      objectStorySpec: { page_id: "PAGE_SOURCE" },
+      assetFeedSpec: {
+        ad_formats: [format],
+        videos: [{ video_id: "V1", thumbnail_hash: "T" }],
+      },
+    };
+    const params = buildDuplicateCreativeParams({
+      ...DEST,
+      source,
+      overrides: { adName: "Spring Sale" },
+    }) as any;
+    assert.deepEqual(params.asset_feed_spec.ad_formats, [format]);
+  }
+});
+
+test("unrecognized multi-format set keeps its first entry rather than guessing", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: { page_id: "PAGE_SOURCE" },
+    assetFeedSpec: {
+      ad_formats: ["AUTOMATIC_FORMAT", "COLLECTION"],
+      images: [{ hash: "IMG1" }],
+    },
+  };
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source,
+    overrides: { adName: "Spring Sale" },
+  }) as any;
+  assert.deepEqual(params.asset_feed_spec.ad_formats, ["AUTOMATIC_FORMAT"]);
+});
+
 test("instagramIdFromCampaignAds: first IG-carrying ad wins; ads without one are skipped", () => {
   const ig = instagramIdFromCampaignAds([
     { creative: { object_story_spec: { page_id: "P" } } } as any,
