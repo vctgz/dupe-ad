@@ -191,8 +191,14 @@ body {
   color: var(--fas-ink);
   font-family: var(--fas-font-sans);
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  -webkit-tap-highlight-color: transparent;
   text-rendering: optimizeLegibility;
   letter-spacing: -0.006em;
+}
+
+h1, h2, h3 {
+  text-wrap: balance;
 }
 
 /* Text selection matches the dupe.ad site (soft blue, not the browser default). */
@@ -205,6 +211,68 @@ body {
 .font-mono,
 [class*="font-mono"] {
   font-feature-settings: "tnum" 1, "zero" 1;
+}
+
+/* The filter input renders its own clear button — suppress WebKit's native
+   search-cancel X so the field never shows two clear affordances. */
+input[type="search"]::-webkit-search-cancel-button,
+input[type="search"]::-webkit-search-decoration {
+  -webkit-appearance: none;
+}
+
+/* Scrollbars in the design system's voice: thin, hairline-toned, trackless —
+   the table's horizontal scrollbar shouldn't look like a foreign OS control. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--fas-hairline-strong) transparent;
+}
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--fas-hairline-strong);
+  border: 3px solid transparent;
+  border-radius: var(--fas-radius-pill);
+  background-clip: content-box;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Entrance motion — durations come from the motion tokens, so reduced-motion
+   collapses both to an instant appearance (no separate media query needed). */
+@keyframes fas-rise {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.fas-rise {
+  animation: fas-rise var(--fas-dur-slow) var(--fas-ease) both;
+}
+
+@keyframes fas-pop {
+  from { opacity: 0; transform: translateY(-4px) scale(0.98); }
+  to   { opacity: 1; transform: none; }
+}
+.fas-pop-in {
+  animation: fas-pop var(--fas-dur-base) var(--fas-ease) both;
+  transform-origin: top left;
+}
+
+/* Primary action "gel": a whisper of top light over the accent fill plus a
+   grounding shadow — the Linear/Vercel primary-button signature. Composes over
+   bg-accent; :active flattens to a pressed inset; disabled resets entirely. */
+.fas-btn-primary {
+  background-image: linear-gradient(to bottom, rgba(255, 255, 255, 0.14), rgba(255, 255, 255, 0) 55%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), 0 1px 2px rgba(15, 23, 42, 0.18);
+}
+.fas-btn-primary:active {
+  background-image: none;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.22);
+}
+.fas-btn-primary:disabled {
+  background-image: none;
+  box-shadow: none;
 }
 
 /* -----------------------------------------------------------------------------

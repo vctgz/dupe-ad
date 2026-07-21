@@ -292,8 +292,30 @@ export default function Dashboard({
 
         {/* States */}
         {loading && (
-          <div className="rounded-fas-lg border border-hairline bg-surface p-8 text-center text-fas-13 text-ink-muted shadow-fas-card">
-            Scanning campaigns for <span className="font-medium text-ink">{account.label}</span>…
+          <div
+            role="status"
+            className="overflow-hidden rounded-fas-lg border border-hairline bg-surface shadow-fas-card"
+          >
+            <p className="border-b border-hairline bg-surface-sunken px-4 py-2.5 text-fas-12 text-ink-muted">
+              Scanning campaigns for <span className="font-medium text-ink">{account.label}</span>…
+            </p>
+            {/* Skeleton rows shaped like the table (status pill · name+id · page id),
+                staggered so the pulse reads as a sweep rather than a blink. */}
+            {Array.from({ length: 6 }, (_, i) => (
+              <div
+                key={i}
+                aria-hidden="true"
+                className="flex animate-pulse items-center gap-4 border-b border-hairline px-4 py-3.5 last:border-b-0"
+                style={{ animationDelay: `${i * 120}ms` }}
+              >
+                <span className="h-4 w-16 shrink-0 rounded-fas-pill bg-surface-sunken" />
+                <span className="flex min-w-0 grow flex-col gap-1.5">
+                  <span className="h-3 w-1/2 max-w-64 rounded-fas-sm bg-surface-sunken" />
+                  <span className="h-2.5 w-24 rounded-fas-sm bg-surface-sunken" />
+                </span>
+                <span className="h-3 w-28 shrink-0 rounded-fas-sm bg-surface-sunken" />
+              </div>
+            ))}
           </div>
         )}
 
@@ -316,7 +338,9 @@ export default function Dashboard({
 
         {!loading && !error && discovery && rows.length === 0 && (
           <div className="rounded-fas-lg border border-hairline bg-surface p-8 text-center shadow-fas-card">
-            <MapPin size={22} strokeWidth={1.75} aria-hidden="true" className="mx-auto mb-2 text-ink-faint" />
+            <span className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-fas-pill bg-surface-sunken">
+              <MapPin size={18} strokeWidth={1.75} aria-hidden="true" className="text-ink-faint" />
+            </span>
             <p className="text-fas-14 font-semibold text-ink">No campaigns to show</p>
             <p className="mt-1 text-fas-13 text-ink-muted">
               {discovery.note ?? `No campaigns were returned for ${account.label}.`}
@@ -362,7 +386,9 @@ export default function Dashboard({
             </div>
             {filteredRows.length === 0 ? (
               <div className="rounded-fas-lg border border-hairline bg-surface p-8 text-center shadow-fas-card">
-                <SearchX size={22} strokeWidth={1.75} aria-hidden="true" className="mx-auto mb-2 text-ink-faint" />
+                <span className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-fas-pill bg-surface-sunken">
+                  <SearchX size={18} strokeWidth={1.75} aria-hidden="true" className="text-ink-faint" />
+                </span>
                 <p className="text-fas-14 font-semibold text-ink">No campaigns match the current filters</p>
                 <p className="mt-1 text-fas-13 text-ink-muted">
                   Adjust the filter or the search text to see more rows.
@@ -399,7 +425,7 @@ export default function Dashboard({
           Suppressed while the modal is open so its CTAs never read through the
           scrim and collide with the modal footer's primary action. */}
       {selectedCount > 0 && !modalMode ? (
-        <div className="sticky bottom-0 z-30 border-t border-hairline-strong bg-surface/95 shadow-fas-pop backdrop-blur">
+        <div className="fas-rise sticky bottom-0 z-30 border-t border-hairline-strong bg-surface/95 pb-[env(safe-area-inset-bottom)] shadow-fas-pop backdrop-blur">
           <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-3 px-4 py-3 sm:px-6">
             <div className="flex items-center gap-2 text-fas-13">
               <span className="inline-flex h-6 min-w-6 items-center justify-center rounded-fas-pill bg-accent px-2 font-mono text-fas-12 font-semibold tabular-nums text-ink-on-accent">
@@ -430,7 +456,7 @@ export default function Dashboard({
               <button
                 type="button"
                 onClick={() => setModalMode("create")}
-                className="fas-focus inline-flex items-center gap-2 rounded-fas-md bg-accent px-4 py-2 text-fas-13 font-semibold text-ink-on-accent transition-colors duration-[110ms] ease-fas hover:bg-accent-hover active:bg-accent-pressed"
+                className="fas-focus fas-btn-primary inline-flex items-center gap-2 rounded-fas-md bg-accent px-4 py-2 text-fas-13 font-semibold text-ink-on-accent transition-colors duration-[110ms] ease-fas hover:bg-accent-hover active:bg-accent-pressed"
               >
                 <Plus size={14} strokeWidth={2} aria-hidden="true" />
                 Create new ad

@@ -361,10 +361,19 @@ export default function DiscoveryTable({
       <button
         type="button"
         onClick={() => toggleSort(key)}
-        className="fas-focus inline-flex items-center gap-1 rounded-fas-sm text-fas-11 font-semibold uppercase tracking-caps text-ink-muted transition-colors hover:text-ink"
+        className="fas-focus group inline-flex select-none items-center gap-1 rounded-fas-sm text-fas-11 font-semibold uppercase tracking-caps text-ink-muted transition-colors hover:text-ink"
       >
         {label}
-        <span className={`text-[10px] ${active ? "text-ink-muted" : "text-ink-faint"}`} aria-hidden="true">
+        {/* Inactive columns keep the ↕ hint invisible-but-present (opacity, not
+            display) so revealing it on hover/focus never shifts the header. */}
+        <span
+          className={`text-[10px] transition-opacity duration-[110ms] ${
+            active
+              ? "text-ink-muted"
+              : "text-ink-faint opacity-0 group-hover:opacity-100 group-focus-visible:opacity-100"
+          }`}
+          aria-hidden="true"
+        >
           {active ? (asc ? "▲" : "▼") : "↕"}
         </span>
       </button>

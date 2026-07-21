@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Hanken_Grotesk, Sora, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
 
@@ -28,8 +28,17 @@ const mono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Dupe.Ad",
+  // Lowercase to match the wordmark — the tab title and the header read as one brand.
+  title: "dupe.ad",
   description: "Bulk-duplicate Meta ads across all your Pages.",
+};
+
+// Tint the browser chrome (mobile URL bar, PWA title bar) to the app frame.
+export const viewport: Viewport = {
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#EDEFF2" },
+    { media: "(prefers-color-scheme: dark)", color: "#0A0C10" },
+  ],
 };
 
 export default function RootLayout({

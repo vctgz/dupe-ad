@@ -78,7 +78,7 @@ export default function BulkSelect({
         <div
           role="dialog"
           aria-label="Bulk-select by store number"
-          className="absolute left-0 z-40 mt-2 w-[20rem] rounded-fas-lg border border-hairline bg-surface p-3 shadow-fas-pop"
+          className="fas-pop-in absolute left-0 z-40 mt-2 w-[20rem] rounded-fas-lg border border-hairline bg-surface p-3 shadow-fas-pop"
         >
           <div className="flex items-center justify-between gap-2">
             <span className="text-fas-13 font-semibold text-ink">Select by store number</span>
@@ -144,7 +144,7 @@ export default function BulkSelect({
               type="button"
               onClick={apply}
               disabled={text.trim().length === 0}
-              className="fas-focus inline-flex items-center gap-1.5 rounded-fas-md bg-accent px-3.5 py-1.5 text-fas-12 font-semibold text-ink-on-accent transition-colors duration-[110ms] ease-fas hover:bg-accent-hover active:bg-accent-pressed disabled:cursor-not-allowed disabled:bg-surface-sunken disabled:text-ink-faint"
+              className="fas-focus fas-btn-primary inline-flex items-center gap-1.5 rounded-fas-md bg-accent px-3.5 py-1.5 text-fas-12 font-semibold text-ink-on-accent transition-colors duration-[110ms] ease-fas hover:bg-accent-hover active:bg-accent-pressed disabled:cursor-not-allowed disabled:bg-surface-sunken disabled:text-ink-faint"
             >
               Select
             </button>
