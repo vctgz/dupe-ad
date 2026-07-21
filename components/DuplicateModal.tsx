@@ -1853,7 +1853,13 @@ export default function DuplicateModal({
           {/* Media — first, so copy can be generated from it. */}
           <div className="flex flex-col gap-3">
             <span className="text-fas-11 font-semibold uppercase tracking-caps text-ink-faint">
-              {isVideo ? "Video + thumbnail" : isCarousel ? "Cards" : "Images"}
+              {!isCreate
+                ? "Image override (optional)"
+                : isVideo
+                  ? "Video + thumbnail"
+                  : isCarousel
+                    ? "Cards"
+                    : "Images"}
               {isCreate ? <span className="ml-0.5 text-accent" aria-hidden="true">*</span> : null}
             </span>
             {isVideo ? (
@@ -1969,6 +1975,24 @@ export default function DuplicateModal({
                   </span>
                 </div>
               </div>
+            ) : !isCreate ? (
+              // Duplicate mode: ONE slot. The upload REPLACES each clone's image
+              // (and feeds Generate Copy); blank keeps each store's own image.
+              <>
+                <div className="grid grid-cols-1 items-start gap-4 sm:grid-cols-3">
+                  <Dropzone
+                    placement={PLACEMENTS[0]!}
+                    image={images.square}
+                    onPick={(file) => pickImage(PLACEMENTS[0]!, file)}
+                    onClear={() => clearImage("square")}
+                  />
+                </div>
+                <p className="text-fas-11 text-ink-muted">
+                  Replaces the cloned ad&apos;s image on every selected store. Blank keeps
+                  each store&apos;s own image. (Video source ads use the video overrides
+                  below instead.)
+                </p>
+              </>
             ) : (
               <div className="grid grid-cols-1 items-start gap-4 sm:grid-cols-3">
                 {PLACEMENTS.map((p) => (
@@ -2204,7 +2228,7 @@ export default function DuplicateModal({
               <>
                 {" "}
                 — each store&apos;s own <span className="font-mono text-ink-mono">{adName || "…"}</span> ad, cloned
-                as-is (any typed copy or uploaded video above overrides just that piece)
+                as-is (any typed copy or uploaded image/video above overrides just that piece)
                 {newAdName.trim() ? (
                   <>
                     , created as <span className="font-mono text-ink-mono">{newAdName.trim()}</span>

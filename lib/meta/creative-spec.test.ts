@@ -956,6 +956,124 @@ test("H2: single video_data with blank copy rebuilt multi-ratio omits empty text
 
 // ── instagramIdFromCampaignAds / sourceHasVideo (multi-IG accounts, 100/1772103) ─────
 
+// ── Image override (duplicate mode) ──────────────────────────────────────────
+// The uploaded image must replace the clone's image everywhere the old one
+// appeared — silently keeping the source image is the bug this guards against.
+
+test("image override: single-image link_data — hash swapped, read-back urls dropped", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: {
+      page_id: "PAGE_SOURCE",
+      link_data: {
+        message: "Old body",
+        link: "https://example.com/old",
+        image_hash: "OLD_HASH",
+        picture: "https://scontent.xx.fbcdn.net/old.jpg",
+      },
+    },
+    assetFeedSpec: null,
+  };
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source,
+    overrides: { adName: "Fall Prep" },
+    imageOverrideHash: "NEW_HASH",
+  }) as any;
+  assert.equal(params.object_story_spec.link_data.image_hash, "NEW_HASH");
+  assert.equal(params.object_story_spec.link_data.picture, undefined);
+  assert.equal(params.object_story_spec.link_data.message, "Old body");
+});
+
+test("image override: image asset feed — every entry's hash replaced, labels kept", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: { page_id: "PAGE_SOURCE" },
+    assetFeedSpec: {
+      ad_formats: ["SINGLE_IMAGE"],
+      images: [
+        { hash: "OLD_A", url: "https://cdn/old-a.jpg", id: "i1", adlabels: [{ name: "IMG_A" }] },
+        { hash: "OLD_B", url: "https://cdn/old-b.jpg", id: "i2", adlabels: [{ name: "IMG_B" }] },
+      ],
+      bodies: [{ text: "Body" }],
+    },
+  };
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source,
+    overrides: { adName: "Fall Prep" },
+    imageOverrideHash: "NEW_HASH",
+  }) as any;
+  const imgs = params.asset_feed_spec.images;
+  assert.equal(imgs.length, 2);
+  for (const img of imgs) {
+    assert.equal(img.hash, "NEW_HASH");
+    assert.equal(img.url, undefined);
+    assert.equal(img.id, undefined);
+  }
+  assert.deepEqual(imgs[0].adlabels, [{ name: "IMG_A" }]);
+});
+
+test("image override: video sources throw (video_data and video asset feed)", () => {
+  const videoData: DuplicateSourceCreative = {
+    objectStorySpec: { page_id: "P", video_data: { video_id: "V" } },
+    assetFeedSpec: null,
+  };
+  const videoFeed: DuplicateSourceCreative = {
+    objectStorySpec: { page_id: "P" },
+    assetFeedSpec: { ad_formats: ["SINGLE_VIDEO"], videos: [{ video_id: "V" }] },
+  };
+  for (const source of [videoData, videoFeed]) {
+    assert.throws(
+      () =>
+        buildDuplicateCreativeParams({
+          ...DEST,
+          source,
+          overrides: { adName: "Fall Prep" },
+          imageOverrideHash: "NEW_HASH",
+        }),
+      /video/i,
+    );
+  }
+});
+
+test("image override: carousel source throws rather than flattening the cards", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: {
+      page_id: "P",
+      link_data: {
+        link: "https://example.com",
+        child_attachments: [{ image_hash: "A" }, { image_hash: "B" }],
+      },
+    },
+    assetFeedSpec: null,
+  };
+  assert.throws(
+    () =>
+      buildDuplicateCreativeParams({
+        ...DEST,
+        source,
+        overrides: { adName: "Fall Prep" },
+        imageOverrideHash: "NEW_HASH",
+      }),
+    /carousel/i,
+  );
+});
+
+test("image override: omitted keeps the source image untouched", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: {
+      page_id: "PAGE_SOURCE",
+      link_data: { link: "https://example.com", image_hash: "OLD_HASH" },
+    },
+    assetFeedSpec: null,
+  };
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source,
+    overrides: { adName: "Fall Prep" },
+  }) as any;
+  assert.equal(params.object_story_spec.link_data.image_hash, "OLD_HASH");
+});
+
 // ── Flexible-format sources (error 100/1885374) ──────────────────────────────
 // A source ad built in Ads Manager with mixed media reads back an asset feed
 // listing EVERY format it serves; the write endpoint takes exactly one.

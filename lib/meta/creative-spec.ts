@@ -474,6 +474,62 @@ function applyVideoOverrides(
   );
 }
 
+/**
+ * Apply an IMAGE replacement to a source creative before cloning it. Mirrors the
+ * video-override contract: the uploaded image replaces the cloned ad's image
+ * everywhere the old one appeared; no upload keeps the source's own image.
+ *
+ * How it lands depends on the source's shape:
+ *   single-image link_data — image_hash swapped in place (read-back `picture` /
+ *     `image_url` variants dropped so the new hash is authoritative).
+ *   image asset_feed_spec — every images[] entry's hash replaced in place, labels
+ *     and customization rules untouched, so per-placement rules keep resolving.
+ *   video shapes / carousel — throws (surfaced as that store's per-row error):
+ *     an image can't replace a video, and one image can't address a carousel's
+ *     per-card images.
+ */
+function applyImageOverride(
+  source: DuplicateSourceCreative,
+  imageHash: string,
+): DuplicateSourceCreative {
+  if (sourceHasVideo(source)) {
+    throw new Error(
+      "The source ad is a video ad — an image can't replace its video. Use the video override slots instead.",
+    );
+  }
+  if (source.assetFeedSpec) {
+    const afs = cloneJson(source.assetFeedSpec);
+    const entries = Array.isArray(afs.images)
+      ? (afs.images as Record<string, unknown>[])
+      : null;
+    if (!entries || entries.length === 0) {
+      throw new Error("The source ad's creative carries no image to replace.");
+    }
+    for (const e of entries) {
+      e.hash = imageHash;
+      delete e.url;
+      delete e.url_128;
+      delete e.id;
+    }
+    return { objectStorySpec: source.objectStorySpec, assetFeedSpec: afs };
+  }
+  const ld = source.objectStorySpec?.link_data as Record<string, unknown> | undefined;
+  if (!ld) {
+    throw new Error("The source ad's creative carries no image to replace.");
+  }
+  if (Array.isArray(ld.child_attachments)) {
+    throw new Error(
+      "The source ad is a carousel — one image can't replace its per-card images. Clear the image override.",
+    );
+  }
+  const oss = cloneJson(source.objectStorySpec!);
+  const cloned = oss.link_data as Record<string, unknown>;
+  cloned.image_hash = imageHash;
+  delete cloned.picture;
+  delete cloned.image_url;
+  return { objectStorySpec: oss, assetFeedSpec: null };
+}
+
 // ── Read-back → write-safe sanitizers ───────────────────────────────────────────
 //
 // Graph's creative READ representation (what findSourceAdCreative pulls) is NOT a valid
@@ -711,6 +767,8 @@ export function buildDuplicateCreativeParams(args: {
   overrides: DuplicateOverrides;
   /** Per-aspect video replacements; empty/omitted keeps the source ad's videos. */
   videoOverrides?: VideoPlacement[];
+  /** Account-scoped hash replacing the source ad's image; omitted keeps its own. */
+  imageOverrideHash?: string | null;
 }): Record<string, unknown> {
   const { pageId, instagramUserId, overrides } = args;
   const name = `${overrides.adName} — creative`;
@@ -724,10 +782,13 @@ export function buildDuplicateCreativeParams(args: {
   // on Instagram). null only when neither exists.
   const igId = instagramUserId ?? sourceInstagramId(args.source);
 
-  const source =
-    args.videoOverrides && args.videoOverrides.length > 0
-      ? applyVideoOverrides(args.source, args.videoOverrides)
-      : args.source;
+  let source = args.source;
+  if (args.imageOverrideHash) {
+    source = applyImageOverride(source, args.imageOverrideHash);
+  }
+  if (args.videoOverrides && args.videoOverrides.length > 0) {
+    source = applyVideoOverrides(source, args.videoOverrides);
+  }
 
   // Multi-aspect source (today: our own 1-3 ratio video ads) — reuse the labeled
   // asset array + placement rules VERBATIM (account-scoped ids are already valid

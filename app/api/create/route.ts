@@ -430,8 +430,9 @@ export async function POST(
   //   single   — one image;
   //   video    — the thumbnail image + a READY registered video;
   //   carousel — one image per card (2-10).
-  // Duplicate mode uploads NOTHING here — each store's own source ad is resolved
-  // fresh, per campaign, inside the write loop below (findSourceAdCreative).
+  // Duplicate mode uploads nothing HERE — each store's own source ad is resolved
+  // fresh, per campaign, inside the write loop below (findSourceAdCreative); its
+  // optional image override uploads once, just after this block.
   let content: CreativeContent | null = null;
   if (mode === "create") {
     if (format === "carousel") {
@@ -533,6 +534,42 @@ export async function POST(
     // inside the write loop (buildDuplicateCreativeParams handles the shapes).
     const notReady = await verifyVideosReady(token, videos);
     if (notReady) return notReady;
+  }
+
+  // Duplicate-mode IMAGE override: an uploaded image REPLACES each clone's image
+  // (the modal's override contract — it is not just Generate Copy fodder). Uploaded
+  // ONCE here (the hash is account-scoped) and swapped into every store's cloned
+  // creative in the write loop; no upload keeps each store's own image.
+  let imageOverrideHash: string | null = null;
+  if (mode === "duplicate" && images.length > 0) {
+    const chosen = images.find((i) => i.placement === "square") ?? images[0]!;
+    const base64 = base64FromDataUrl(chosen.dataUrl);
+    if (!base64) {
+      return NextResponse.json(
+        { error: "The image override must be a base64 image data URL." },
+        { status: 400 },
+      );
+    }
+    if (base64.length > 10_000_000) {
+      return NextResponse.json(
+        { error: "The image override is too large (over ~7MB)." },
+        { status: 413 },
+      );
+    }
+    try {
+      imageOverrideHash = await uploadImage(account, token, base64);
+    } catch (err) {
+      const msg =
+        err instanceof MetaApiError
+          ? metaErrorToMessage(err)
+          : err instanceof Error
+            ? err.message
+            : "Image upload failed";
+      return NextResponse.json(
+        { error: `Could not upload the image override: ${msg}` },
+        { status: 502 },
+      );
+    }
   }
 
   // Resolve the account's conversion pixel so created ads have "Website events" tracking
@@ -685,6 +722,9 @@ export async function POST(
           // Per-aspect video replacements (already verified READY above); empty
           // keeps every ratio from this store's own source ad.
           videoOverrides: videos.length > 0 ? videos : undefined,
+          // Uploaded once above; swaps this clone's image (per-row error on a
+          // video/carousel source). null keeps the store's own image.
+          imageOverrideHash,
         });
       } else {
         // Create: this store's landing page wins over the modal's fallback URL. A
