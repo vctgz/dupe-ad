@@ -99,6 +99,9 @@ const bodySchema = z
     // below so an in-flight session survives the rollout.
     videoId: z.string().regex(/^\d{1,32}$/).optional(),
     adName: z.string().min(1).max(512),
+    // Duplicate mode only: the name for the CREATED ads. Blank/omitted keeps the
+    // source ad's name — `adName` stays the finder either way.
+    newAdName: z.string().trim().max(512).optional(),
     // Optional: target only ad sets whose name CONTAINS this (case-insensitive) in each
     // campaign. Omitted -> the campaign's active (else first) ad set.
     adsetName: z.string().trim().max(512).optional(),
@@ -334,6 +337,10 @@ export async function POST(
   const { accountSlug, mode, format, adName, campaignIds, creative, images, cards } =
     parsed.data;
   const adsetName = parsed.data.adsetName?.trim() || undefined;
+  // The name every CREATED ad (and its creative) carries. Duplicate: an explicit
+  // newAdName wins, else the clone keeps the source ad's name. Create: adName IS
+  // the new ad's name.
+  const createdAdName = (mode === "duplicate" && parsed.data.newAdName) || adName;
   // Normalize the video slots: prefer the new `videos[]`, else adapt the legacy
   // single `videoId` (a modal open across the deploy). superRefine already checked
   // presence + unique placements for video format.
@@ -668,7 +675,7 @@ export async function POST(
             accountInstagramId,
           source: found,
           overrides: {
-            adName,
+            adName: createdAdName,
             primaryText: creative.primaryText.trim() || undefined,
             headline: creative.headline.trim() || undefined,
             subheadline: creative.subheadline.trim() || undefined,
@@ -712,7 +719,12 @@ export async function POST(
       // One batched round trip per store: creative + PAUSED ad as dependent Graph
       // batch ops (both still count individually toward rate limits).
       const writeOne = (): Promise<string> =>
-        createCreativeAndPausedAd(account, token, { adName, creativeParams, adsetId, pixelId });
+        createCreativeAndPausedAd(account, token, {
+          adName: createdAdName,
+          creativeParams,
+          adsetId,
+          pixelId,
+        });
 
       let adId: string;
       try {

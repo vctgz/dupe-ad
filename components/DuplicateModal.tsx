@@ -1018,6 +1018,9 @@ export default function DuplicateModal({
   const [headline, setHeadline] = useState("");
   const [subheadline, setSubheadline] = useState("");
   const [adName, setAdName] = useState("");
+  // Duplicate mode only: optional name for the CREATED ads; blank keeps the source
+  // ad's name (adName stays the finder).
+  const [newAdName, setNewAdName] = useState("");
   const [adsetName, setAdsetName] = useState("");
   const [link, setLink] = useState("");
   const [cta, setCta] = useState<string>("");
@@ -1641,6 +1644,7 @@ export default function DuplicateModal({
         videos: videoPayload,
         cards: cardPayload,
         adName: adName.trim(),
+        newAdName: isCreate ? undefined : newAdName.trim() || undefined,
         adsetName: adsetName.trim() || undefined,
         creative: {
           primaryText,
@@ -1761,6 +1765,24 @@ export default function DuplicateModal({
               className="fas-focus w-full rounded-fas-md border border-hairline bg-surface px-3.5 py-2.5 text-fas-14 text-ink placeholder:text-ink-muted"
             />
           </Field>
+
+          {/* Duplicate only: what to NAME the clones. Blank keeps the source name. */}
+          {!isCreate ? (
+            <Field
+              label="New ad name"
+              helper="Optional. The name for the created ads. Blank keeps the source ad's name."
+              htmlFor="dm-newadname"
+            >
+              <input
+                id="dm-newadname"
+                type="text"
+                value={newAdName}
+                onChange={(e) => setNewAdName(e.target.value)}
+                placeholder="e.g. June '26 Promo"
+                className="fas-focus w-full rounded-fas-md border border-hairline bg-surface px-3.5 py-2.5 text-fas-14 text-ink placeholder:text-ink-muted"
+              />
+            </Field>
+          ) : null}
 
           <Field
             label="Ad set name"
@@ -2182,7 +2204,13 @@ export default function DuplicateModal({
               <>
                 {" "}
                 — each store&apos;s own <span className="font-mono text-ink-mono">{adName || "…"}</span> ad, cloned
-                as-is (any typed copy or uploaded video above overrides just that piece).{" "}
+                as-is (any typed copy or uploaded video above overrides just that piece)
+                {newAdName.trim() ? (
+                  <>
+                    , created as <span className="font-mono text-ink-mono">{newAdName.trim()}</span>
+                  </>
+                ) : null}
+                .{" "}
               </>
             )}
             Each is created <span className="font-semibold text-ink">PAUSED</span> — nothing goes live until you
