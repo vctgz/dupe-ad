@@ -166,8 +166,28 @@ const bodySchema = z
 
     // Duplicate mode clones an already-valid creative and only patches explicit
     // overrides — none of Create's format/media requiredness applies. Only adName
-    // (unconditionally required above) matters: it's the source ad to find.
-    if (val.mode !== "create") return;
+    // (unconditionally required above) matters: it's the source ad to find. A
+    // carousel override rebuilds the WHOLE creative, so it can't combine with the
+    // piecemeal image/video replacements.
+    if (val.mode !== "create") {
+      if (val.cards && val.cards.length > 0) {
+        if ((val.videos?.length ?? 0) > 0 || val.videoId) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ["cards"],
+            message: "Carousel cards can't combine with video overrides.",
+          });
+        }
+        if (val.images.length > 0) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ["cards"],
+            message: "Carousel cards can't combine with an image override.",
+          });
+        }
+      }
+      return;
+    }
 
     if (val.format !== "carousel") {
       if (val.images.length === 0) {
@@ -442,62 +462,87 @@ export async function POST(
   // Duplicate mode uploads nothing HERE — each store's own source ad is resolved
   // fresh, per campaign, inside the write loop below (findSourceAdCreative); its
   // optional image override uploads once, just after this block.
+  // Decode + upload carousel cards (shared by Create's carousel format and
+  // Duplicate's carousel override). Returns the uploaded specs, or the error
+  // response to send as-is. An arrow (not a hoisted declaration) so the `account`
+  // non-null narrowing above flows into the closure.
+  const decodeAndUploadCards = async (
+    cardsIn: NonNullable<typeof cards>,
+  ): Promise<
+    { ok: true; cards: CarouselCardSpec[] } | { ok: false; res: NextResponse<ApiError> }
+  > => {
+    const decoded: { base64: string; headline: string; description?: string; link?: string }[] =
+      [];
+    for (const [i, card] of cardsIn.entries()) {
+      if (card.link && !isHttpUrl(card.link)) {
+        return {
+          ok: false,
+          res: NextResponse.json(
+            { error: `Card ${i + 1}: the link is not a valid http(s) URL.` },
+            { status: 400 },
+          ),
+        };
+      }
+      const b64 = base64FromDataUrl(card.dataUrl);
+      if (!b64) {
+        return {
+          ok: false,
+          res: NextResponse.json(
+            { error: `Card ${i + 1}: the image must be a base64 image data URL.` },
+            { status: 400 },
+          ),
+        };
+      }
+      if (b64.length > 10_000_000) {
+        return {
+          ok: false,
+          res: NextResponse.json(
+            { error: `Card ${i + 1}: the image is too large (over ~7MB).` },
+            { status: 413 },
+          ),
+        };
+      }
+      decoded.push({
+        base64: b64,
+        headline: card.headline,
+        description: card.description,
+        link: card.link,
+      });
+    }
+    const cardSpecs: CarouselCardSpec[] = [];
+    try {
+      for (const d of decoded) {
+        cardSpecs.push({
+          imageHash: await uploadImage(account, token, d.base64),
+          headline: d.headline,
+          description: d.description,
+          link: d.link,
+        });
+      }
+    } catch (err) {
+      const msg =
+        err instanceof MetaApiError
+          ? metaErrorToMessage(err)
+          : err instanceof Error
+            ? err.message
+            : "Image upload failed";
+      return {
+        ok: false,
+        res: NextResponse.json(
+          { error: `Could not upload the image for card ${cardSpecs.length + 1}: ${msg}` },
+          { status: 502 },
+        ),
+      };
+    }
+    return { ok: true, cards: cardSpecs };
+  };
+
   let content: CreativeContent | null = null;
   if (mode === "create") {
     if (format === "carousel") {
-      const cardsIn = cards ?? [];
-      const decoded: { base64: string; headline: string; description?: string; link?: string }[] =
-        [];
-      for (const [i, card] of cardsIn.entries()) {
-        if (card.link && !isHttpUrl(card.link)) {
-          return NextResponse.json(
-            { error: `Card ${i + 1}: the link is not a valid http(s) URL.` },
-            { status: 400 },
-          );
-        }
-        const b64 = base64FromDataUrl(card.dataUrl);
-        if (!b64) {
-          return NextResponse.json(
-            { error: `Card ${i + 1}: the image must be a base64 image data URL.` },
-            { status: 400 },
-          );
-        }
-        if (b64.length > 10_000_000) {
-          return NextResponse.json(
-            { error: `Card ${i + 1}: the image is too large (over ~7MB).` },
-            { status: 413 },
-          );
-        }
-        decoded.push({
-          base64: b64,
-          headline: card.headline,
-          description: card.description,
-          link: card.link,
-        });
-      }
-      const cardSpecs: CarouselCardSpec[] = [];
-      try {
-        for (const d of decoded) {
-          cardSpecs.push({
-            imageHash: await uploadImage(account, token, d.base64),
-            headline: d.headline,
-            description: d.description,
-            link: d.link,
-          });
-        }
-      } catch (err) {
-        const msg =
-          err instanceof MetaApiError
-            ? metaErrorToMessage(err)
-            : err instanceof Error
-              ? err.message
-              : "Image upload failed";
-        return NextResponse.json(
-          { error: `Could not upload the image for card ${cardSpecs.length + 1}: ${msg}` },
-          { status: 502 },
-        );
-      }
-      content = { kind: "carousel", cards: cardSpecs };
+      const uploaded = await decodeAndUploadCards(cards ?? []);
+      if (!uploaded.ok) return uploaded.res;
+      content = { kind: "carousel", cards: uploaded.cards };
     } else {
       // Pick one image (square preferred), decode it, and reject anything oversized.
       // For video ads this image is the REQUIRED thumbnail.
@@ -543,6 +588,17 @@ export async function POST(
     // inside the write loop (buildDuplicateCreativeParams handles the shapes).
     const notReady = await verifyVideosReady(token, videos);
     if (notReady) return notReady;
+  }
+
+  // Duplicate-mode CAROUSEL override: the operator's cards REPLACE each clone's
+  // whole creative; the destination link, primary text, and CTA are inherited per
+  // store from its own source ad (that's the point — each store keeps its URL).
+  // Card images upload once here, account-scoped, like Create's carousel.
+  let carouselOverride: CarouselCardSpec[] | null = null;
+  if (mode === "duplicate" && cards && cards.length > 0) {
+    const uploaded = await decodeAndUploadCards(cards);
+    if (!uploaded.ok) return uploaded.res;
+    carouselOverride = uploaded.cards;
   }
 
   // Duplicate-mode IMAGE override: an uploaded image REPLACES each clone's image
@@ -737,6 +793,9 @@ export async function POST(
           // Replaces utm_content across the clone's url_tags + destination URLs;
           // blank keeps the source ad's own tracking.
           utmContent: parsed.data.utmContent || undefined,
+          // Rebuilds the clone as a carousel of the uploaded cards; link/copy/CTA
+          // inherited from this store's own source ad unless typed above.
+          carouselOverride,
         });
       } else {
         // Create: this store's landing page wins over the modal's fallback URL. A

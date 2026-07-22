@@ -799,6 +799,69 @@ export function applyUtmContentOverride(params: Record<string, unknown>, value: 
   }
 }
 
+// ── Source-creative readers (duplicate mode) ────────────────────────────────────
+// The per-store values a carousel override inherits from the ad it replaces:
+// destination link, primary text, and CTA type — read across every source shape.
+
+/** The source ad's own destination link: link_data.link, else its CTA link, else
+ *  the video CTA link, else the asset feed's first link_urls entry. */
+export function sourceLinkOf(source: DuplicateSourceCreative): string | null {
+  const oss = source.objectStorySpec;
+  const ld = oss?.link_data as Record<string, unknown> | undefined;
+  const vd = oss?.video_data as Record<string, unknown> | undefined;
+  const ctaLink = (cta: unknown): unknown =>
+    (cta as { value?: { link?: unknown } } | undefined)?.value?.link;
+  const linkUrls = source.assetFeedSpec?.link_urls;
+  const candidates = [
+    ld?.link,
+    ctaLink(ld?.call_to_action),
+    ctaLink(vd?.call_to_action),
+    Array.isArray(linkUrls)
+      ? (linkUrls[0] as { website_url?: unknown } | undefined)?.website_url
+      : undefined,
+  ];
+  for (const c of candidates) {
+    if (typeof c === "string" && c.length > 0) return c;
+  }
+  return null;
+}
+
+/** The source ad's own primary text (link_data/video_data message, else the asset
+ *  feed's first body). */
+function sourceMessageOf(source: DuplicateSourceCreative): string | null {
+  const oss = source.objectStorySpec;
+  const ld = oss?.link_data as Record<string, unknown> | undefined;
+  const vd = oss?.video_data as Record<string, unknown> | undefined;
+  const bodies = source.assetFeedSpec?.bodies;
+  const candidates = [
+    ld?.message,
+    vd?.message,
+    Array.isArray(bodies) ? (bodies[0] as { text?: unknown } | undefined)?.text : undefined,
+  ];
+  for (const c of candidates) {
+    if (typeof c === "string" && c.length > 0) return c;
+  }
+  return null;
+}
+
+/** The source ad's own CTA type (SHOP_NOW, …), wherever its shape keeps it. */
+function sourceCtaTypeOf(source: DuplicateSourceCreative): string | null {
+  const oss = source.objectStorySpec;
+  const ld = oss?.link_data as Record<string, unknown> | undefined;
+  const vd = oss?.video_data as Record<string, unknown> | undefined;
+  const type = (cta: unknown): unknown => (cta as { type?: unknown } | undefined)?.type;
+  const ctaTypes = source.assetFeedSpec?.call_to_action_types;
+  const candidates = [
+    type(ld?.call_to_action),
+    type(vd?.call_to_action),
+    Array.isArray(ctaTypes) ? ctaTypes[0] : undefined,
+  ];
+  for (const c of candidates) {
+    if (typeof c === "string" && c.length > 0) return c;
+  }
+  return null;
+}
+
 /**
  * The source ad's OWN Instagram identity — modern `instagram_user_id`, or the legacy
  * `instagram_actor_id` — read from its object_story_spec. Used as a fallback when the
@@ -875,6 +938,11 @@ export function buildDuplicateCreativeParams(args: {
   /** Replaces utm_content in the clone's tracking (url_tags + destination URLs);
    *  omitted keeps the source ad's own tracking untouched. */
   utmContent?: string | null;
+  /** Replaces the whole creative with a CAROUSEL of these cards (2-10, images
+   *  already uploaded). Destination link, primary text, and CTA are inherited
+   *  per store from the source ad unless explicitly overridden — that's the
+   *  point: each store keeps its own URL. Exclusive with image/video overrides. */
+  carouselOverride?: CarouselCardSpec[] | null;
 }): Record<string, unknown> {
   const { pageId, instagramUserId, overrides } = args;
   const name = `${overrides.adName} — creative`;
@@ -896,6 +964,52 @@ export function buildDuplicateCreativeParams(args: {
   // is on the same Page, so it's valid — and video creatives need an explicit id to serve
   // on Instagram). null only when neither exists.
   const igId = instagramUserId ?? sourceInstagramId(args.source);
+
+  // Carousel override: the creative is REBUILT as a carousel of the operator's
+  // cards; only the source's per-store link/copy/CTA (and url_tags, via finalize)
+  // survive. Handled before the clone branches — nothing else of the source shape
+  // applies.
+  if (args.carouselOverride && args.carouselOverride.length > 0) {
+    if (args.imageOverrideHash || (args.videoOverrides && args.videoOverrides.length > 0)) {
+      throw new Error(
+        "Choose ONE media override — carousel cards can't combine with an image or video replacement.",
+      );
+    }
+    const link = overrides.link ?? sourceLinkOf(args.source);
+    if (!link) {
+      throw new Error(
+        "The source ad carries no destination link to reuse — set a Destination URL override for the carousel.",
+      );
+    }
+    const ctaType = overrides.cta ?? sourceCtaTypeOf(args.source);
+    const useCta = !!ctaType && ctaType !== "NO_BUTTON";
+    const identity: Record<string, unknown> = { page_id: pageId };
+    if (igId) identity.instagram_user_id = igId;
+    identity.link_data = {
+      message: overrides.primaryText ?? sourceMessageOf(args.source) ?? "",
+      link,
+      child_attachments: args.carouselOverride.map((card) => {
+        const cardLink = card.link && card.link.trim().length > 0 ? card.link : link;
+        const attachment: Record<string, unknown> = {
+          link: cardLink,
+          image_hash: card.imageHash,
+          name: card.headline,
+        };
+        if (card.description && card.description.trim().length > 0) {
+          attachment.description = card.description;
+        }
+        if (useCta) {
+          attachment.call_to_action = { type: ctaType, value: { link: cardLink } };
+        }
+        return attachment;
+      }),
+      // Same posture as Create-mode carousels: keep the operator's card order and
+      // skip the auto-generated Page end card.
+      multi_share_optimized: false,
+      multi_share_end_card: false,
+    };
+    return finalize({ name, object_story_spec: identity });
+  }
 
   let source = args.source;
   if (args.imageOverrideHash) {

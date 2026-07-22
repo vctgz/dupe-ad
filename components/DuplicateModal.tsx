@@ -1040,6 +1040,11 @@ export default function DuplicateModal({
   // Carousel cards, in display order.
   const [cards, setCards] = useState<CardState[]>([emptyCard(1), emptyCard(2)]);
   const nextCardId = useRef(3);
+  // Duplicate mode: which media override the operator is building. "image" shows
+  // the single replace-image slot (default; empty = keep source media); "carousel"
+  // swaps in the card editor and REBUILDS each clone as a carousel — the
+  // destination link stays each store's own (from its source ad).
+  const [dupCarousel, setDupCarousel] = useState(false);
 
   const [previewing, setPreviewing] = useState(false);
   const [plan, setPlan] = useState<DuplicatePreviewResponse | null>(null);
@@ -1075,7 +1080,10 @@ export default function DuplicateModal({
   const linkOk = isValidUrl(link);
   const adNameOk = adName.trim().length > 0;
   const isVideo = isCreate && format === "video";
-  const isCarousel = isCreate && format === "carousel";
+  // Carousel content is live in BOTH modes: Create's carousel format, or
+  // Duplicate's carousel override. Everything card-driven (editor, Generate Copy,
+  // payload) keys off this.
+  const isCarousel = isCreate ? format === "carousel" : dupCarousel;
   const videoList = useMemo(
     () => Object.values(videos).filter((v): v is VideoState => !!v),
     [videos],
@@ -1107,7 +1115,9 @@ export default function DuplicateModal({
   // cloned, not typed — plus no video override still mid-pipeline), and not busy.
   const canCreate =
     writeEnabled &&
-    (isCreate ? createReady : adNameOk && !anyVideoBusy) &&
+    (isCreate
+      ? createReady
+      : adNameOk && !anyVideoBusy && (!dupCarousel || cardsReady)) &&
     phase === "idle" &&
     !previewing;
 
@@ -1637,7 +1647,7 @@ export default function DuplicateModal({
       });
       const videoPayload = isVideo
         ? readyVideoSlots
-        : !isCreate && readyVideoSlots.length > 0
+        : !isCreate && !dupCarousel && readyVideoSlots.length > 0
           ? readyVideoSlots
           : undefined;
       const payloadBase = {
@@ -1858,7 +1868,9 @@ export default function DuplicateModal({
           <div className="flex flex-col gap-3">
             <span className="text-fas-11 font-semibold uppercase tracking-caps text-ink-faint">
               {!isCreate
-                ? "Image override (optional)"
+                ? dupCarousel
+                  ? "Carousel cards"
+                  : "Image override (optional)"
                 : isVideo
                   ? "Video + thumbnail"
                   : isCarousel
@@ -1866,6 +1878,43 @@ export default function DuplicateModal({
                     : "Images"}
               {isCreate ? <span className="ml-0.5 text-accent" aria-hidden="true">*</span> : null}
             </span>
+
+            {/* Duplicate mode: pick the media override kind. A carousel REBUILDS
+                the whole creative from cards, so it structurally excludes the
+                piecemeal image/video replacements (their sections hide). */}
+            {!isCreate ? (
+              <div
+                className="inline-flex gap-1 self-start rounded-fas-md border border-hairline bg-surface-sunken p-1"
+                role="radiogroup"
+                aria-label="Media override type"
+              >
+                {(
+                  [
+                    { carousel: false, label: "Replace image" },
+                    { carousel: true, label: "Carousel" },
+                  ] as const
+                ).map((o) => {
+                  const active = dupCarousel === o.carousel;
+                  return (
+                    <button
+                      key={o.label}
+                      type="button"
+                      role="radio"
+                      aria-checked={active}
+                      onClick={() => setDupCarousel(o.carousel)}
+                      className={[
+                        "fas-focus rounded-fas-sm px-3 py-1.5 text-fas-12 font-semibold transition-colors",
+                        active
+                          ? "bg-surface text-ink shadow-fas-card"
+                          : "text-ink-muted hover:text-ink",
+                      ].join(" ")}
+                    >
+                      {o.label}
+                    </button>
+                  );
+                })}
+              </div>
+            ) : null}
             {isVideo ? (
               <>
                 <div className="grid grid-cols-1 items-start gap-4 sm:grid-cols-4">
@@ -1974,8 +2023,9 @@ export default function DuplicateModal({
                     Add card ({cards.length}/{MAX_CARDS})
                   </button>
                   <span className="text-fas-11 text-ink-muted">
-                    Cards without a link use the Destination URL (or the store&apos;s mapped
-                    landing page).
+                    {isCreate
+                      ? "Cards without a link use the Destination URL (or the store's mapped landing page)."
+                      : "Cards without a link keep each store's own destination — its mapped landing page, the Destination URL override, or the source ad's own link."}
                   </span>
                 </div>
               </div>
@@ -2066,7 +2116,7 @@ export default function DuplicateModal({
               keeps that ratio's video from each store's own source ad; a filled slot
               swaps in the new video. Needs write creds (uploads register against the
               ad account immediately), so hidden without them. */}
-          {!isCreate && writeEnabled ? (
+          {!isCreate && writeEnabled && !dupCarousel ? (
             <div className="flex flex-col gap-3">
               <span className="text-fas-11 font-semibold uppercase tracking-caps text-ink-faint">
                 Video overrides (optional)
@@ -2251,8 +2301,10 @@ export default function DuplicateModal({
             ) : (
               <>
                 {" "}
-                — each store&apos;s own <span className="font-mono text-ink-mono">{adName || "…"}</span> ad, cloned
-                as-is (any typed copy or uploaded image/video above overrides just that piece)
+                — each store&apos;s own <span className="font-mono text-ink-mono">{adName || "…"}</span> ad
+                {dupCarousel
+                  ? ", rebuilt as a carousel of your cards (each store keeps its own destination link, copy, and CTA unless typed above)"
+                  : ", cloned as-is (any typed copy or uploaded image/video above overrides just that piece)"}
                 {newAdName.trim() ? (
                   <>
                     , created as <span className="font-mono text-ink-mono">{newAdName.trim()}</span>

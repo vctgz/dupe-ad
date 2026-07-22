@@ -957,6 +957,118 @@ test("H2: single video_data with blank copy rebuilt multi-ratio omits empty text
 
 // ── instagramIdFromCampaignAds / sourceHasVideo (multi-IG accounts, 100/1772103) ─────
 
+// ── Carousel override (duplicate mode) ───────────────────────────────────────
+// The clone is REBUILT as a carousel of the operator's cards; the destination
+// link, primary text, and CTA are inherited per store from the source ad.
+
+const CAROUSEL_SOURCE: DuplicateSourceCreative = {
+  objectStorySpec: {
+    page_id: "PAGE_SOURCE",
+    instagram_user_id: "IG_SOURCE",
+    link_data: {
+      message: "Store body",
+      link: "https://store.example.com/landing",
+      image_hash: "OLD",
+      call_to_action: { type: "SHOP_NOW", value: { link: "https://store.example.com/landing" } },
+    },
+  },
+  assetFeedSpec: null,
+};
+
+test("carousel override: cards replace the creative; link/copy/CTA inherited per store", () => {
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source: CAROUSEL_SOURCE,
+    overrides: { adName: "Fall Prep" },
+    carouselOverride: [
+      { imageHash: "C1", headline: "Card one" },
+      { imageHash: "C2", headline: "Card two", description: "Desc", link: "https://own.example.com/x" },
+    ],
+  }) as any;
+  const ld = params.object_story_spec.link_data;
+  assert.equal(params.object_story_spec.page_id, "PAGE_DEST");
+  assert.equal(ld.message, "Store body");
+  assert.equal(ld.link, "https://store.example.com/landing");
+  assert.equal(ld.multi_share_optimized, false);
+  assert.equal(ld.multi_share_end_card, false);
+  // Card 1: no own link → the store's own source-ad link, CTA inherited.
+  assert.deepEqual(ld.child_attachments[0], {
+    link: "https://store.example.com/landing",
+    image_hash: "C1",
+    name: "Card one",
+    call_to_action: { type: "SHOP_NOW", value: { link: "https://store.example.com/landing" } },
+  });
+  // Card 2: keeps its own link everywhere.
+  assert.equal(ld.child_attachments[1].link, "https://own.example.com/x");
+  assert.equal(ld.child_attachments[1].description, "Desc");
+  assert.equal(ld.child_attachments[1].call_to_action.value.link, "https://own.example.com/x");
+});
+
+test("carousel override: typed link/copy/CTA overrides beat the inherited values", () => {
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source: CAROUSEL_SOURCE,
+    overrides: {
+      adName: "Fall Prep",
+      link: "https://typed.example.com/promo",
+      primaryText: "Typed body",
+      cta: "LEARN_MORE",
+    },
+    carouselOverride: [{ imageHash: "C1", headline: "Card one" }],
+  }) as any;
+  const ld = params.object_story_spec.link_data;
+  assert.equal(ld.link, "https://typed.example.com/promo");
+  assert.equal(ld.message, "Typed body");
+  assert.equal(ld.child_attachments[0].call_to_action.type, "LEARN_MORE");
+});
+
+test("carousel override: composes with utmContent and carries url_tags", () => {
+  const params = buildDuplicateCreativeParams({
+    ...DEST,
+    source: { ...CAROUSEL_SOURCE, urlTags: "utm_source=fb&utm_content=old" },
+    overrides: { adName: "Fall Prep" },
+    carouselOverride: [{ imageHash: "C1", headline: "Card one" }],
+    utmContent: "fall_carousel",
+  }) as any;
+  assert.equal(params.url_tags, "utm_source=fb&utm_content=fall_carousel");
+  // url_tags governs — the card links (no utm_content of their own) stay clean.
+  assert.equal(
+    params.object_story_spec.link_data.child_attachments[0].link,
+    "https://store.example.com/landing",
+  );
+});
+
+test("carousel override: refuses to combine with image/video overrides", () => {
+  assert.throws(
+    () =>
+      buildDuplicateCreativeParams({
+        ...DEST,
+        source: CAROUSEL_SOURCE,
+        overrides: { adName: "Fall Prep" },
+        carouselOverride: [{ imageHash: "C1", headline: "Card one" }],
+        imageOverrideHash: "IMG",
+      }),
+    /ONE media override/i,
+  );
+});
+
+test("carousel override: source with no link anywhere and none typed throws", () => {
+  const source: DuplicateSourceCreative = {
+    objectStorySpec: { page_id: "P", link_data: { message: "Body" } },
+    assetFeedSpec: null,
+  };
+  assert.throws(
+    () =>
+      buildDuplicateCreativeParams({
+        ...DEST,
+        source,
+        overrides: { adName: "Fall Prep" },
+        carouselOverride: [{ imageHash: "C1", headline: "Card one" }],
+      }),
+    /no destination link/i,
+  );
+});
+
 // ── utm_content override (duplicate mode) ────────────────────────────────────
 // Meta URLs and url_tags may carry {{...}} macros — every byte except the
 // utm_content pair must survive verbatim (URLSearchParams would encode braces).
