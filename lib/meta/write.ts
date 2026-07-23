@@ -209,6 +209,7 @@ interface MetaSourceAd {
   id: string;
   name?: string;
   effective_status?: string;
+  adset_id?: string;
   creative?: {
     object_story_spec?: Record<string, unknown>;
     asset_feed_spec?: Record<string, unknown>;
@@ -216,32 +217,22 @@ interface MetaSourceAd {
   };
 }
 
-/**
- * Find the ad named `adName` (case-insensitive EXACT match — matching the modal's
- * "exact ad name" contract; ACTIVE preferred among ties) within ONE campaign, and
- * return its full creative shape for DUPLICATE mode. The destination ad reuses
- * these account-scoped asset references (image_hash / video_id) directly — nothing
- * is re-uploaded. Returns null when no ad in this campaign matches.
- */
-export async function findSourceAdCreative(
+/** Fetch a campaign's ads whose name CONTAINs `nameContains` (server-side filter),
+ *  backing off on Meta error #1 like every other campaign-scoped pull here. */
+async function fetchCampaignAdsNamed<T extends { id: string }>(
   token: string,
   campaignId: string,
-  adName: string,
-): Promise<DuplicateSourceCreative | null> {
-  const filtering = JSON.stringify([{ field: "name", operator: "CONTAIN", value: adName }]);
-  let ads: MetaSourceAd[] | null = null;
+  nameContains: string,
+  fields: string,
+): Promise<T[]> {
+  const filtering = JSON.stringify([
+    { field: "name", operator: "CONTAIN", value: nameContains },
+  ]);
+  let ads: T[] | null = null;
   let lastErr: unknown;
   for (const limit of SOURCE_AD_PAGE_SIZES) {
     try {
-      ads = await get<MetaSourceAd>(
-        `${campaignId}/ads`,
-        {
-          fields: "id,name,effective_status,creative{object_story_spec,asset_feed_spec,url_tags}",
-          limit,
-          filtering,
-        },
-        token,
-      );
+      ads = await get<T>(`${campaignId}/ads`, { fields, limit, filtering }, token);
       break;
     } catch (err) {
       if (err instanceof MetaApiError && err.code === 1) {
@@ -254,6 +245,45 @@ export async function findSourceAdCreative(
     }
   }
   if (ads === null) throw lastErr;
+  return ads;
+}
+
+/** A campaign ad's identity slice, as the duplicate guard needs it. */
+export interface CampaignAdRef {
+  id: string;
+  name: string;
+  adsetId: string | null;
+}
+
+/** What DUPLICATE mode learns about a campaign's source ad in one read. */
+export interface SourceAdMatch {
+  creative: DuplicateSourceCreative;
+  /** The chosen source ad — excluded from the duplicate-guard namesake check. */
+  sourceAdId: string;
+  /** Every ad in the campaign whose name CONTAINed the query (id/name/ad set) —
+   *  the duplicate guard scans these for an already-existing clone. */
+  namesakes: CampaignAdRef[];
+}
+
+/**
+ * Find the ad named `adName` (case-insensitive EXACT match — matching the modal's
+ * "exact ad name" contract; ACTIVE preferred among ties) within ONE campaign, and
+ * return its full creative shape for DUPLICATE mode plus the campaign's namesake
+ * ads (for the duplicate guard). The destination ad reuses the creative's
+ * account-scoped asset references (image_hash / video_id) directly — nothing is
+ * re-uploaded. Returns null when no ad in this campaign matches.
+ */
+export async function findSourceAdCreative(
+  token: string,
+  campaignId: string,
+  adName: string,
+): Promise<SourceAdMatch | null> {
+  const ads = await fetchCampaignAdsNamed<MetaSourceAd>(
+    token,
+    campaignId,
+    adName,
+    "id,name,effective_status,adset_id,creative{object_story_spec,asset_feed_spec,url_tags}",
+  );
 
   const target = adName.trim().toLowerCase();
   const matches = ads.filter((a) => (a.name ?? "").trim().toLowerCase() === target);
@@ -261,10 +291,35 @@ export async function findSourceAdCreative(
   const chosen =
     matches.find((a) => (a.effective_status ?? "").toUpperCase() === "ACTIVE") ?? matches[0]!;
   return {
-    objectStorySpec: chosen.creative?.object_story_spec ?? null,
-    assetFeedSpec: chosen.creative?.asset_feed_spec ?? null,
-    urlTags: chosen.creative?.url_tags ?? null,
+    creative: {
+      objectStorySpec: chosen.creative?.object_story_spec ?? null,
+      assetFeedSpec: chosen.creative?.asset_feed_spec ?? null,
+      urlTags: chosen.creative?.url_tags ?? null,
+    },
+    sourceAdId: chosen.id,
+    namesakes: ads.map((a) => ({
+      id: a.id,
+      name: a.name ?? "",
+      adsetId: a.adset_id ?? null,
+    })),
   };
+}
+
+/** The campaign's ads matching `name` (CONTAIN, cheap identity fields only) — the
+ *  duplicate guard's lookup when the clones carry a DIFFERENT name than the source
+ *  (the "New ad name" override), which the source-ad read can't see. */
+export async function findAdsNamedLike(
+  token: string,
+  campaignId: string,
+  name: string,
+): Promise<CampaignAdRef[]> {
+  const ads = await fetchCampaignAdsNamed<MetaSourceAd>(
+    token,
+    campaignId,
+    name,
+    "id,name,adset_id",
+  );
+  return ads.map((a) => ({ id: a.id, name: a.name ?? "", adsetId: a.adset_id ?? null }));
 }
 
 interface MetaCampaignIgAd {

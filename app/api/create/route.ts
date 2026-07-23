@@ -44,6 +44,7 @@ import {
   createCreativeAndPausedAd,
   fetchAdsetsByCampaign,
   findCampaignInstagramId,
+  findAdsNamedLike,
   findSourceAdCreative,
   getVideoStatus,
   pickAdsetFromList,
@@ -262,11 +263,17 @@ export interface CreateAdResultRow {
   adId?: string;
   pageId?: string | null;
   error?: string;
+  /** Duplicate guard: an identically-named clone already existed in the target
+   *  ad set — nothing new was created (adId is the EXISTING ad). */
+  skipped?: boolean;
 }
 
 export interface CreateAdsResponse {
   count: number;
   created: number;
+  /** Duplicate guard: stores skipped because an identically-named clone already
+   *  existed in the target ad set. */
+  skipped?: number;
   failed: number;
   results: CreateAdResultRow[];
   /** True when the run hit its time budget before processing every selected store. */
@@ -760,6 +767,33 @@ export async function POST(
           });
           continue;
         }
+
+        // DUPLICATE GUARD — re-running (after a partial failure, a double run, or
+        // a colleague's overlapping run) must not mint a SECOND copy. Skip when
+        // the TARGET ad set already holds an ad with the clone's name that isn't
+        // the source ad itself. When the clones carry the source's own name the
+        // source-ad read already fetched the namesakes; a "New ad name" needs its
+        // own (cheap, identity-only) lookup. A different target ad set — or a
+        // clone renamed in Ads Manager — intentionally passes.
+        const targetName = createdAdName.trim().toLowerCase();
+        const namesakes =
+          targetName === adName.trim().toLowerCase()
+            ? found.namesakes
+            : await findAdsNamedLike(token, campaignId, createdAdName);
+        const existing = namesakes.find(
+          (a) =>
+            a.id !== found.sourceAdId &&
+            a.adsetId === adsetId &&
+            a.name.trim().toLowerCase() === targetName,
+        );
+        if (existing) {
+          results.push({
+            campaignId, storeCode, campaignName, ok: true,
+            adId: existing.id, pageId, skipped: true,
+          });
+          continue;
+        }
+
         creativeParams = buildDuplicateCreativeParams({
           pageId,
           // Store's own IG, else the exact source ad's own (same Page), else any IG an
@@ -770,12 +804,12 @@ export async function POST(
           // video shape needs it and the cheaper sources came up empty.
           instagramUserId:
             row?.instagramUserId ??
-            sourceInstagramId(found) ??
-            (videos.length > 0 || sourceHasVideo(found)
+            sourceInstagramId(found.creative) ??
+            (videos.length > 0 || sourceHasVideo(found.creative)
               ? await findCampaignInstagramId(token, campaignId)
               : null) ??
             accountInstagramId,
-          source: found,
+          source: found.creative,
           overrides: {
             adName: createdAdName,
             primaryText: creative.primaryText.trim() || undefined,
@@ -887,13 +921,15 @@ export async function POST(
     }
   }
 
-  const created = results.filter((r) => r.ok).length;
+  const created = results.filter((r) => r.ok && !r.skipped).length;
+  const skipped = results.filter((r) => r.skipped).length;
   const processed = new Set(results.map((r) => r.campaignId));
   const stopped = timedOut || rateLimited;
   return NextResponse.json({
     count: results.length,
     created,
-    failed: results.length - created,
+    skipped,
+    failed: results.length - created - skipped,
     results,
     timedOut,
     rateLimited,

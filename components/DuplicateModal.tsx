@@ -863,12 +863,14 @@ export function mergeCreateResults(
 ): CreateAdsResponse {
   const redone = new Set(next.results.map((r) => r.campaignId));
   const results = [...prev.results.filter((r) => !redone.has(r.campaignId)), ...next.results];
-  const created = results.filter((r) => r.ok).length;
+  const created = results.filter((r) => r.ok && !r.skipped).length;
+  const skipped = results.filter((r) => r.skipped).length;
   return {
     ...next,
     count: results.length,
     created,
-    failed: results.length - created,
+    skipped,
+    failed: results.length - created - skipped,
     results,
   };
 }
@@ -896,6 +898,14 @@ function CreateResultView({
         <span className="inline-flex items-center gap-1 rounded-fas-pill border border-status-ok-border bg-status-ok-bg px-2.5 py-0.5 font-mono text-status-ok">
           <CheckCircle2 size={11} strokeWidth={2} aria-hidden="true" /> {result.created} created
         </span>
+        {(result.skipped ?? 0) > 0 ? (
+          <span
+            className="inline-flex items-center gap-1 rounded-fas-pill border border-hairline bg-surface px-2.5 py-0.5 font-mono text-ink-muted"
+            title="These stores already had an ad with this name in the target ad set — nothing new was created."
+          >
+            <Info size={11} strokeWidth={2} aria-hidden="true" /> {result.skipped} already existed
+          </span>
+        ) : null}
         {result.failed > 0 ? (
           <span className="inline-flex items-center gap-1 rounded-fas-pill border border-status-mismatch-border bg-status-mismatch-bg px-2.5 py-0.5 font-mono text-status-mismatch">
             <TriangleAlert size={11} strokeWidth={2} aria-hidden="true" /> {result.failed} failed
@@ -946,7 +956,11 @@ function CreateResultView({
           <li key={r.campaignId} className="flex items-start gap-2.5 py-2">
             <span className="mt-px shrink-0">
               {r.ok ? (
-                <CheckCircle2 size={15} strokeWidth={2} className="text-status-ok" aria-hidden="true" />
+                r.skipped ? (
+                  <Info size={15} strokeWidth={2} className="text-ink-faint" aria-hidden="true" />
+                ) : (
+                  <CheckCircle2 size={15} strokeWidth={2} className="text-status-ok" aria-hidden="true" />
+                )
               ) : (
                 <TriangleAlert size={15} strokeWidth={2} className="text-status-mismatch" aria-hidden="true" />
               )}
@@ -962,10 +976,17 @@ function CreateResultView({
               </div>
               <div className="mt-0.5 text-fas-11 text-ink-faint">
                 {r.ok ? (
-                  <>
-                    Created ad <span className="font-mono text-ink-mono">{r.adId}</span> on Page{" "}
-                    <span className="font-mono text-ink-mono">{r.pageId}</span>
-                  </>
+                  r.skipped ? (
+                    <>
+                      Already duplicated — an ad with this name exists in the target ad set
+                      (<span className="font-mono text-ink-mono">{r.adId}</span>). Skipped.
+                    </>
+                  ) : (
+                    <>
+                      Created ad <span className="font-mono text-ink-mono">{r.adId}</span> on Page{" "}
+                      <span className="font-mono text-ink-mono">{r.pageId}</span>
+                    </>
+                  )
                 ) : (
                   <span className="text-status-mismatch">{r.error}</span>
                 )}
