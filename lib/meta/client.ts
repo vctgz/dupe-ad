@@ -109,6 +109,103 @@ function appSecretProof(accessToken: string): string {
   return createHmac("sha256", secret).update(accessToken).digest("hex");
 }
 
+// ── Pipeboard fallback token ────────────────────────────────────────────────────
+//
+// Meta scopes ads-management rate limits PER AD ACCOUNT PER APP. A Pipeboard-issued
+// token belongs to Pipeboard's (Meta Business Partner) app, so when OUR app's
+// bucket is exhausted, the same call through Pipeboard's app draws from a separate,
+// still-Meta-enforced bucket. Configured via PIPEBOARD_API_TOKEN (pipeboard.co →
+// API tokens; the Meta account must be connected there). Absent env → feature off,
+// zero behavior change.
+
+const PIPEBOARD_TOKEN_URL = "https://pipeboard.co/api/meta/token";
+const PIPEBOARD_REFRESH_MARGIN_MS = 5 * 60_000;
+const PIPEBOARD_FETCH_COOLDOWN_MS = 60_000;
+
+let pipeboardCache: { token: string; expiresAt: number } | null = null;
+let pipeboardCooldownUntil = 0;
+
+/**
+ * The Meta access token Pipeboard holds for the connected Meta account, fetched
+ * from GET pipeboard.co/api/meta/token and cached until near its expires_at.
+ * Returns null (with a warn) when unconfigured or the fetch fails — the caller
+ * then just re-throws the original Meta error, so a broken fallback can never
+ * make things worse than having no fallback.
+ */
+async function getPipeboardToken(): Promise<string | null> {
+  const apiToken = process.env.PIPEBOARD_API_TOKEN?.trim();
+  if (!apiToken) return null;
+  const now = Date.now();
+  if (pipeboardCache && pipeboardCache.expiresAt - now > PIPEBOARD_REFRESH_MARGIN_MS) {
+    return pipeboardCache.token;
+  }
+  if (now < pipeboardCooldownUntil) return pipeboardCache?.token ?? null;
+  try {
+    const res = await fetch(
+      `${PIPEBOARD_TOKEN_URL}?api_token=${encodeURIComponent(apiToken)}`,
+      { cache: "no-store", headers: { Accept: "application/json" } },
+    );
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = (await res.json()) as { access_token?: string; expires_at?: string };
+    if (!data.access_token) throw new Error("response carried no access_token");
+    const parsedExpiry = data.expires_at ? Date.parse(data.expires_at) : NaN;
+    pipeboardCache = {
+      token: data.access_token,
+      // Unknown/unparseable expiry: assume an hour and refresh from there.
+      expiresAt: Number.isFinite(parsedExpiry) ? parsedExpiry : now + 3_600_000,
+    };
+    return pipeboardCache.token;
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[meta] Pipeboard token fetch failed:",
+      err instanceof Error ? err.message : err,
+    );
+    pipeboardCooldownUntil = now + PIPEBOARD_FETCH_COOLDOWN_MS;
+    return null;
+  }
+}
+
+/** How a Graph call authenticates. appsecret_proof is OUR app's HMAC — a
+ *  Pipeboard-issued token belongs to Pipeboard's app, so proof must be omitted. */
+interface GraphAuth {
+  token: string;
+  sendProof: boolean;
+}
+
+/** Attach access_token (+ appsecret_proof for our own tokens) to a param bag. */
+function applyAuth(bag: URLSearchParams, auth: GraphAuth): void {
+  bag.set("access_token", auth.token);
+  if (auth.sendProof) bag.set("appsecret_proof", appSecretProof(auth.token));
+}
+
+/**
+ * Run a Graph call with the primary (system-user) token; when Meta RATE-LIMITS it
+ * — or rejects the token itself (code 190, expired/invalid) — and Pipeboard is
+ * configured, retry ONCE with the Pipeboard-held token. Write-retry safety matches
+ * the route's own retry: the primary attempt FAILED, so nothing was created (a
+ * batch may leave an unattached creative behind — inert, same as before).
+ */
+async function withPipeboardFallback<T>(
+  token: string,
+  run: (auth: GraphAuth) => Promise<T>,
+): Promise<T> {
+  try {
+    return await run({ token, sendProof: true });
+  } catch (err) {
+    const fallbackWorthy =
+      err instanceof MetaApiError && (isRateLimitError(err) || err.code === 190);
+    if (!fallbackWorthy) throw err;
+    const pb = await getPipeboardToken();
+    if (!pb || pb === token) throw err;
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[meta] primary token hit code ${(err as MetaApiError).code} — retrying via Pipeboard fallback`,
+    );
+    return run({ token: pb, sendProof: false });
+  }
+}
+
 function baseUrl(): string {
   const { META_GRAPH_VERSION } = getEnv();
   return `https://graph.facebook.com/${META_GRAPH_VERSION}`;
@@ -333,39 +430,41 @@ export async function get<T>(
   params: Record<string, ParamValue>,
   token: string,
 ): Promise<T[]> {
-  const proof = appSecretProof(token);
-  const out: T[] = [];
+  // The fallback wraps the WHOLE paginated read: a rate limit mid-pagination
+  // restarts cleanly from page one on the fallback token (fresh accumulator).
+  return withPipeboardFallback(token, async (auth) => {
+    const out: T[] = [];
 
-  // Build the first URL.
-  const search = new URLSearchParams();
-  for (const [k, v] of Object.entries(params)) {
-    search.set(k, String(v));
-  }
-  search.set("access_token", token);
-  search.set("appsecret_proof", proof);
-
-  let url: string | null = `${baseUrl()}/${path}?${search.toString()}`;
-
-  // Safety cap so a malformed cursor can never loop forever.
-  const MAX_PAGES = 1000;
-  let pages = 0;
-
-  while (url && pages < MAX_PAGES) {
-    const page: MetaPagingResponse<T> = await getOnePage<T>(url, token, path);
-    if (page.data?.length) out.push(...page.data);
-
-    const after = page.paging?.cursors?.after;
-    if (after && page.data && page.data.length > 0) {
-      const nextSearch = new URLSearchParams(search);
-      nextSearch.set("after", after);
-      url = `${baseUrl()}/${path}?${nextSearch.toString()}`;
-    } else {
-      url = null;
+    // Build the first URL.
+    const search = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) {
+      search.set(k, String(v));
     }
-    pages += 1;
-  }
+    applyAuth(search, auth);
 
-  return out;
+    let url: string | null = `${baseUrl()}/${path}?${search.toString()}`;
+
+    // Safety cap so a malformed cursor can never loop forever.
+    const MAX_PAGES = 1000;
+    let pages = 0;
+
+    while (url && pages < MAX_PAGES) {
+      const page: MetaPagingResponse<T> = await getOnePage<T>(url, auth.token, path);
+      if (page.data?.length) out.push(...page.data);
+
+      const after = page.paging?.cursors?.after;
+      if (after && page.data && page.data.length > 0) {
+        const nextSearch = new URLSearchParams(search);
+        nextSearch.set("after", after);
+        url = `${baseUrl()}/${path}?${nextSearch.toString()}`;
+      } else {
+        url = null;
+      }
+      pages += 1;
+    }
+
+    return out;
+  });
 }
 
 /**
@@ -382,30 +481,30 @@ export async function post<T>(
   params: Record<string, unknown>,
   token: string,
 ): Promise<T> {
-  const proof = appSecretProof(token);
-  const body = new URLSearchParams();
-  for (const [k, v] of Object.entries(params)) {
-    if (v === undefined || v === null) continue;
-    body.set(k, typeof v === "object" ? JSON.stringify(v) : String(v));
-  }
-  body.set("access_token", token);
-  body.set("appsecret_proof", proof);
+  return withPipeboardFallback(token, async (auth) => {
+    const body = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) {
+      if (v === undefined || v === null) continue;
+      body.set(k, typeof v === "object" ? JSON.stringify(v) : String(v));
+    }
+    applyAuth(body, auth);
 
-  const res = await fetch(`${baseUrl()}/${path}`, {
-    method: "POST",
-    cache: "no-store",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      Accept: "application/json",
-    },
-    body,
+    const res = await fetch(`${baseUrl()}/${path}`, {
+      method: "POST",
+      cache: "no-store",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Accept: "application/json",
+      },
+      body,
+    });
+
+    const usage = recordUsage(res.headers, path);
+    if (!res.ok) {
+      await throwMetaError(res, path, usage);
+    }
+    return (await res.json()) as T;
   });
-
-  const usage = recordUsage(res.headers, path);
-  if (!res.ok) {
-    await throwMetaError(res, path, usage);
-  }
-  return (await res.json()) as T;
 }
 
 /** One operation inside a Graph batch call. */
@@ -436,7 +535,13 @@ export async function postBatch<T = unknown>(
   ops: BatchRequest[],
   token: string,
 ): Promise<(T | null)[]> {
-  const proof = appSecretProof(token);
+  return withPipeboardFallback(token, (auth) => postBatchWithAuth<T>(ops, auth));
+}
+
+async function postBatchWithAuth<T>(
+  ops: BatchRequest[],
+  auth: GraphAuth,
+): Promise<(T | null)[]> {
   const batch = ops.map((op) => {
     const entry: Record<string, unknown> = {
       method: op.method,
@@ -462,8 +567,7 @@ export async function postBatch<T = unknown>(
   const body = new URLSearchParams();
   body.set("batch", JSON.stringify(batch));
   body.set("include_headers", "false");
-  body.set("access_token", token);
-  body.set("appsecret_proof", proof);
+  applyAuth(body, auth);
 
   const res = await fetch(`${baseUrl()}/`, {
     method: "POST",
@@ -541,23 +645,23 @@ export async function getObject<T>(
   params: Record<string, ParamValue>,
   token: string,
 ): Promise<T> {
-  const proof = appSecretProof(token);
-  const search = new URLSearchParams();
-  for (const [k, v] of Object.entries(params)) {
-    search.set(k, String(v));
-  }
-  search.set("access_token", token);
-  search.set("appsecret_proof", proof);
+  return withPipeboardFallback(token, async (auth) => {
+    const search = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) {
+      search.set(k, String(v));
+    }
+    applyAuth(search, auth);
 
-  const url = `${baseUrl()}/${path}?${search.toString()}`;
-  const res = await fetch(url, {
-    method: "GET",
-    cache: "no-store",
-    headers: { Accept: "application/json" },
+    const url = `${baseUrl()}/${path}?${search.toString()}`;
+    const res = await fetch(url, {
+      method: "GET",
+      cache: "no-store",
+      headers: { Accept: "application/json" },
+    });
+    const usage = recordUsage(res.headers, path);
+    if (!res.ok) {
+      await throwMetaError(res, path, usage);
+    }
+    return (await res.json()) as T;
   });
-  const usage = recordUsage(res.headers, path);
-  if (!res.ok) {
-    await throwMetaError(res, path, usage);
-  }
-  return (await res.json()) as T;
 }

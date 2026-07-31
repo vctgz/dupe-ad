@@ -84,6 +84,7 @@ reads. The optional team login adds a few more (see [Team access](#team-access-o
 | `META_APP_SECRET`         | yes      | Meta App secret (App Dashboard, Settings > Basic).                                            |
 | `META_SYSTEM_USER_TOKEN`  | yes      | Access token with `ads_management`. A long-lived System User token is ideal.                 |
 | `META_TOKEN_<SLUG>`       | no       | Per-account token override, e.g. `META_TOKEN_ACME`. Falls back to `META_SYSTEM_USER_TOKEN`.  |
+| `PIPEBOARD_API_TOKEN`     | no       | [Pipeboard](https://pipeboard.co) API token used as a FALLBACK: when Meta rate-limits the primary token (or rejects it as expired), the call retries once through Pipeboard's app — a separate per-app rate-limit bucket. The Meta account must be connected on Pipeboard. |
 | `TEMPLATE_AD_NAME`        | no       | The ad name Dupe treats as each campaign's template. Defaults to `Template`.                  |
 | `ACCOUNTS_JSON`           | no       | JSON array of account configs. Overrides `config/accounts.ts` when set, so real account ids never touch the repo. |
 | `DISCOVERY_SOURCE`        | no       | `auto` (default), `snapshot`, `live`, or `mapping`. Forces which data source discovery reads from. |
