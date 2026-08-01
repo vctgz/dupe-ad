@@ -36,16 +36,26 @@ async function snapshotExists(slug: string): Promise<boolean> {
  * For the snapshot source, current mapping landing URLs are merged onto a fresh rows
  * copy (snapshots predate the `url` column).
  */
-// Short-TTL cache of LIVE discovery per account. A single user flow (table load -> open
-// modal -> preview -> create, plus the odd re-scan) otherwise re-pulls the whole account
-// from Meta several times and trips its per-user rate limit (error 17). Re-scan passes
+// Cache of LIVE discovery per account. A single user flow (table load -> open modal ->
+// preview -> create, plus the odd re-scan) otherwise re-pulls the whole account from
+// Meta several times and trips its per-user rate limit (error 17). Re-scan passes
 // forceFresh to bypass this; everything else reuses the recent pull.
 //
-// Two-tier: the in-process Map is L1; the optional shared KV store is L2, so a cold
-// start / sibling serverless instance reuses a recent pull instead of hitting Meta
-// again. Same TTL on both tiers — a KV hit is as fresh as a memory hit.
-const LIVE_TTL_MS = 90_000;
+// Two-tier: the in-process Map is L1; the shared KV store is L2, so a cold start /
+// sibling serverless instance reuses a recent pull instead of hitting Meta again. Same
+// TTL on both tiers — a KV hit is as fresh as a memory hit. Campaign structure changes
+// a few times a day, and Re-scan is always one click away, so the window is minutes
+// rather than seconds: several operators working at once then share ONE pull instead of
+// each cold instance re-scanning the whole account.
+const LIVE_TTL_MS = 10 * 60_000;
 const liveCache = new Map<string, { at: number; result: DiscoveryResult }>();
+
+// A "last good" copy kept far beyond the fresh TTL, purely as a rate-limit cushion.
+// When Meta throttles a live pull, the L1 fallback below only helps an instance that
+// already pulled successfully — which a COLD instance never has, so the operator got a
+// hard "Discovery failed" instead of slightly stale data. This shared copy survives
+// cold starts, so a throttled pull degrades to "Cached" for everyone.
+const LAST_GOOD_TTL_SEC = 7 * 24 * 3600;
 
 export async function resolveDiscoveryResult(
   account: AdAccount,
@@ -70,6 +80,7 @@ export async function resolveDiscoveryResult(
   let result: DiscoveryResult;
   if (source === "live") {
     const kvKey = `dupe:live:${account.slug}`;
+    const lastGoodKey = `dupe:live:last:${account.slug}`;
     const cached = liveCache.get(account.slug);
     if (!opts?.forceFresh && cached && Date.now() - cached.at < LIVE_TTL_MS) {
       result = cached.result;
@@ -83,15 +94,19 @@ export async function resolveDiscoveryResult(
           result = await loadLive(account);
           liveCache.set(account.slug, { at: Date.now(), result });
           await kvSet(kvKey, result, LIVE_TTL_MS / 1000);
+          // Refresh the rate-limit cushion on every good pull.
+          await kvSet(lastGoodKey, result, LAST_GOOD_TTL_SEC);
         } catch (err) {
           // Rate-limited live pull: serve the last good result (however old) marked
           // stale, so the table degrades to "Cached" instead of failing outright.
-          // Any other failure, or no prior pull to fall back on, propagates as before.
-          if (cached && isRateLimitError(err)) {
-            result = { ...cached.result, stale: true };
-          } else {
-            throw err;
-          }
+          // This instance's own memory first, else the shared long-lived copy — a cold
+          // instance has no memory, which is exactly when the hard failure used to hit.
+          // Any other failure, or nothing to fall back on, propagates as before.
+          if (!isRateLimitError(err)) throw err;
+          const fallback =
+            cached?.result ?? (await kvGet<DiscoveryResult>(lastGoodKey));
+          if (!fallback) throw err;
+          result = { ...fallback, stale: true };
         }
       }
     }
