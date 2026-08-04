@@ -1703,6 +1703,25 @@ export default function DuplicateModal({
           error?: string;
         };
         if (!res.ok) {
+          // A gateway timeout kills the request with NO body, so we can't know which of
+          // this chunk's stores the server already created. Rather than dead-ending (the
+          // operator's only option was re-running everything, which used to duplicate the
+          // ads the killed run had made), keep what earlier chunks reported and offer
+          // Resume over everything unconfirmed — the server skips stores that already
+          // have this ad, so resuming can't double-create.
+          if (res.status === 504 || res.status === 502 || res.status === 408) {
+            merged = {
+              ...(merged ?? { count: 0, created: 0, failed: 0, results: [] }),
+              timedOut: true,
+              remaining: ids.slice(i),
+            };
+            setCreateResult(merged);
+            setCreateError(
+              `The server timed out on this batch (HTTP ${res.status}). Resume to finish — ` +
+                `any store already created is skipped, so nothing gets duplicated.`,
+            );
+            break;
+          }
           throw new Error(body.error ?? `Create failed (HTTP ${res.status})`);
         }
         merged = merged ? mergeCreateResults(merged, body) : body;

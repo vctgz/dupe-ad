@@ -44,18 +44,20 @@ import {
   createCreativeAndPausedAd,
   fetchAdsetsByCampaign,
   findCampaignInstagramId,
-  findAdsNamedLike,
+  fetchAdsNamedByCampaign,
   findSourceAdCreative,
   getVideoStatus,
   pickAdsetFromList,
   resolveTrackingPixelId,
   sourceHasVideo,
   sourceInstagramId,
+  stripInstagramIdentity,
   uploadImage,
   type CarouselCardSpec,
   type CreativeContent,
   type VideoPlacement,
 } from "@/lib/meta/write";
+import type { CampaignAdRef } from "@/lib/meta/write";
 import type { ApiError } from "@/lib/types";
 import type { CampaignRow, DiscoveryResult } from "@/lib/discovery/types";
 
@@ -63,6 +65,9 @@ export const dynamic = "force-dynamic";
 // Live writes fan out serialized across many stores; give the function headroom beyond
 // Vercel's short default (60s is the Hobby ceiling; raise on Pro for very large batches).
 export const maxDuration = 60;
+
+/** Meta's subcode for "Ad account has no access to this Instagram account." */
+const IG_NO_ACCESS_SUBCODE = 1815199;
 
 // Meta call_to_action_type allow-list (mirrors the modal's CTA_OPTIONS). Anything
 // outside this set is rejected rather than forwarded to the Graph API.
@@ -448,12 +453,21 @@ export async function POST(
     if (r.campaignId) byId.set(r.campaignId, r);
   }
 
-  // Account-wide Instagram identity fallback. A store's own row may not resolve an IG id
-  // (its campaign's template ad had none), yet video asset_feed_spec creatives REQUIRE an
-  // explicit instagram_user_id to serve on Instagram (error 100/1772103). Every store here
-  // advertises as the same brand IG, so any campaign that DID resolve one gives the id to
-  // reuse — no extra Graph calls, just the discovery data we already hold.
-  const accountInstagramId = discovery.rows.find((r) => r.instagramUserId)?.instagramUserId ?? null;
+  // Account-wide Instagram identity fallback — ONLY for a single-brand account.
+  //
+  // A store's own row may not resolve an IG id, and video asset_feed_spec creatives want
+  // an explicit instagram_user_id to serve on Instagram (error 100/1772103). Reusing
+  // another campaign's id is safe ONLY when every store advertises as the same handle.
+  // On a multi-IG account (each store Page linked to its own IG — Runnings, True Value)
+  // borrowing one is actively wrong: Meta rejects it with error 200/1815199 ("Ad account
+  // has no access to this Instagram account"), and if it were accepted the ad would run
+  // under another store's handle. So we only reuse when the account resolves exactly ONE
+  // distinct id; otherwise we pass none and the ad runs under the store's own Page.
+  const distinctInstagramIds = new Set(
+    discovery.rows.map((r) => r.instagramUserId).filter((id): id is string => !!id),
+  );
+  const accountInstagramId =
+    distinctInstagramIds.size === 1 ? [...distinctInstagramIds][0]! : null;
 
   // Per-store landing pages from the mapping CSV's `url` column. When a store has
   // one, its ad links there; otherwise it falls back to the single Destination URL
@@ -673,6 +687,24 @@ export async function POST(
     return NextResponse.json({ error: `Could not load ad sets: ${msg}` }, { status: 502 });
   }
 
+  // "Already created" guard data — every ad in the account already carrying the name
+  // this run would create, grouped by campaign, in ONE read. Makes a re-run idempotent
+  // for BOTH modes, which matters most when a run dies without reporting: a gateway
+  // timeout (504) returns no body, so the operator re-runs and previously got a second
+  // copy of everything the killed run had already created.
+  // Best-effort: if the lookup fails we simply lose the guard rather than the run.
+  let existingNamedByCampaign = new Map<string, CampaignAdRef[]>();
+  try {
+    existingNamedByCampaign = await fetchAdsNamedByCampaign(token, account.id, createdAdName);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[create] ${account.slug}: could not pre-load existing "${createdAdName}" ads ` +
+        `(duplicate guard disabled for this run):`,
+      err instanceof Error ? err.message : err,
+    );
+  }
+
   // SERIALIZE writes within the account (rate-limit safety, #8). Per-store results.
   // A wall-clock budget stops the loop before the function's maxDuration so we always
   // RETURN the results so far (with timedOut + remaining) instead of dying with no body —
@@ -685,7 +717,13 @@ export async function POST(
   const wanted = [...new Set(campaignIds)];
   const results: CreateAdResultRow[] = [];
   const startedAt = Date.now();
-  const BUDGET_MS = 50_000;
+  // Wall-clock budget, checked BETWEEN stores. It must leave room for the slowest
+  // single store to finish inside maxDuration (60s): a video store can spend an IG
+  // lookup, a creative+ad batch, and a 5s rate-limit backoff after the check passes.
+  // At 50s that overshot, and Vercel killed the request — a 504 with NO body, so ads
+  // this run had already created were invisible to the client and a re-run duplicated
+  // them. 40s keeps the whole response inside the limit.
+  const BUDGET_MS = 40_000;
   const PACE_AT = 85; // utilization percent where writes start slowing down
   const RETRY_BACKOFF_MS = 5_000;
   const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -729,6 +767,32 @@ export async function POST(
       // otherwise apply.
       const storeUrl = storeCode ? landingUrls.get(storeCode) ?? null : null;
 
+      // Has this exact ad already been created in the target ad set? `excludeAdId` is
+      // duplicate mode's SOURCE ad, which shares the name whenever the clone keeps it.
+      // A different ad set — or a clone renamed in Ads Manager — intentionally passes.
+      const alreadyCreated = (excludeAdId?: string) => {
+        const target = createdAdName.trim().toLowerCase();
+        return (existingNamedByCampaign.get(campaignId) ?? []).find(
+          (a) =>
+            a.id !== excludeAdId &&
+            a.adsetId === adsetId &&
+            a.name.trim().toLowerCase() === target,
+        );
+      };
+
+      // Create mode has no source ad to exclude, so it can check up front. (Duplicate
+      // mode checks after resolving its source ad, which it must exclude by id.)
+      if (mode !== "duplicate") {
+        const existing = alreadyCreated();
+        if (existing) {
+          results.push({
+            campaignId, storeCode, campaignName, ok: true,
+            adId: existing.id, pageId, skipped: true,
+          });
+          continue;
+        }
+      }
+
       // Proactive pacing: when Meta's usage headers say we're near the wall, breathe
       // between stores (inside the budget) instead of slamming into error 17. Runs
       // before ANY further per-campaign Graph calls — duplicate mode's source-ad
@@ -769,23 +833,10 @@ export async function POST(
         }
 
         // DUPLICATE GUARD — re-running (after a partial failure, a double run, or
-        // a colleague's overlapping run) must not mint a SECOND copy. Skip when
-        // the TARGET ad set already holds an ad with the clone's name that isn't
-        // the source ad itself. When the clones carry the source's own name the
-        // source-ad read already fetched the namesakes; a "New ad name" needs its
-        // own (cheap, identity-only) lookup. A different target ad set — or a
-        // clone renamed in Ads Manager — intentionally passes.
-        const targetName = createdAdName.trim().toLowerCase();
-        const namesakes =
-          targetName === adName.trim().toLowerCase()
-            ? found.namesakes
-            : await findAdsNamedLike(token, campaignId, createdAdName);
-        const existing = namesakes.find(
-          (a) =>
-            a.id !== found.sourceAdId &&
-            a.adsetId === adsetId &&
-            a.name.trim().toLowerCase() === targetName,
-        );
+        // a colleague's overlapping run) must not mint a SECOND copy. Skip when the
+        // TARGET ad set already holds an ad with the clone's name that isn't the
+        // source ad itself.
+        const existing = alreadyCreated(found.sourceAdId);
         if (existing) {
           results.push({
             campaignId, storeCode, campaignName, ok: true,
@@ -875,13 +926,31 @@ export async function POST(
       try {
         adId = await writeOne();
       } catch (err) {
-        // Retry ONCE on a rate limit, if the budget still has room for backoff + a
-        // creative/ad pair. (If the creative was made but the ad call was throttled,
-        // the retry makes a fresh creative; the unattached one is inert and harmless.)
-        const budgetLeft = BUDGET_MS - (Date.now() - startedAt);
-        if (!isRateLimitError(err) || budgetLeft < RETRY_BACKOFF_MS + 10_000) throw err;
-        await sleep(RETRY_BACKOFF_MS);
-        adId = await writeOne();
+        if (
+          err instanceof MetaApiError &&
+          err.subcode === IG_NO_ACCESS_SUBCODE &&
+          stripInstagramIdentity(creativeParams)
+        ) {
+          // This store's Page has no usable Instagram account (not linked, or not
+          // assigned to the ad account). Meta does NOT fall back on its own, so the
+          // whole store used to fail. Retry once with the Instagram identity removed:
+          // the ad then runs under the store's Facebook Page alone.
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[create] ${account.slug} campaign ${campaignId}: Instagram identity rejected ` +
+              `(200/${IG_NO_ACCESS_SUBCODE}) — retrying with the Facebook Page only`,
+          );
+          sentCreativeParams = creativeParams;
+          adId = await writeOne();
+        } else {
+          // Retry ONCE on a rate limit, if the budget still has room for backoff + a
+          // creative/ad pair. (If the creative was made but the ad call was throttled,
+          // the retry makes a fresh creative; the unattached one is inert and harmless.)
+          const budgetLeft = BUDGET_MS - (Date.now() - startedAt);
+          if (!isRateLimitError(err) || budgetLeft < RETRY_BACKOFF_MS + 10_000) throw err;
+          await sleep(RETRY_BACKOFF_MS);
+          adId = await writeOne();
+        }
       }
       results.push({ campaignId, storeCode, campaignName, ok: true, adId, pageId });
     } catch (err) {

@@ -16,6 +16,7 @@ import {
   setUtmContentInUrl,
   sourceHasVideo,
   sourceInstagramId,
+  stripInstagramIdentity,
   type VideoPlacementKey,
   type CreativeContent,
   type CreativeInput,
@@ -956,6 +957,49 @@ test("H2: single video_data with blank copy rebuilt multi-ratio omits empty text
 });
 
 // ── instagramIdFromCampaignAds / sourceHasVideo (multi-IG accounts, 100/1772103) ─────
+
+// ── Instagram identity fallback (error 200/1815199) ──────────────────────────
+// A store whose Page has no usable IG account must still get its ad, under the
+// Facebook Page alone — so the write is retried with the identity stripped.
+
+test("stripInstagramIdentity: removes modern and legacy ids, keeps the rest", () => {
+  const params = {
+    name: "Fall Prep — creative",
+    object_story_spec: {
+      page_id: "PAGE",
+      instagram_user_id: "IG",
+      instagram_actor_id: "IG_LEGACY",
+      link_data: { link: "https://example.com", image_hash: "H" },
+    },
+  };
+  assert.equal(stripInstagramIdentity(params), true);
+  const oss = params.object_story_spec as Record<string, unknown>;
+  assert.equal("instagram_user_id" in oss, false);
+  assert.equal("instagram_actor_id" in oss, false);
+  // Everything that makes the ad an ad survives.
+  assert.equal(oss.page_id, "PAGE");
+  assert.deepEqual(oss.link_data, { link: "https://example.com", image_hash: "H" });
+});
+
+test("stripInstagramIdentity: false when there was no identity to strip", () => {
+  // False must mean "a retry would send the identical body" — the caller uses this to
+  // avoid spending a second Graph call that would fail the same way.
+  assert.equal(
+    stripInstagramIdentity({ object_story_spec: { page_id: "PAGE" } }),
+    false,
+  );
+  assert.equal(stripInstagramIdentity({ name: "no story spec" }), false);
+});
+
+test("stripInstagramIdentity: works on the asset-feed shape (identity-only story spec)", () => {
+  const params = {
+    object_story_spec: { page_id: "PAGE", instagram_user_id: "IG" },
+    asset_feed_spec: { ad_formats: ["SINGLE_VIDEO"], videos: [{ video_id: "V" }] },
+  };
+  assert.equal(stripInstagramIdentity(params), true);
+  assert.deepEqual(params.object_story_spec, { page_id: "PAGE" });
+  assert.deepEqual(params.asset_feed_spec.videos, [{ video_id: "V" }]);
+});
 
 // ── Carousel override (duplicate mode) ───────────────────────────────────────
 // The clone is REBUILT as a carousel of the operator's cards; the destination

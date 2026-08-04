@@ -799,6 +799,24 @@ export function applyUtmContentOverride(params: Record<string, unknown>, value: 
   }
 }
 
+/**
+ * Drop the Instagram identity from built creative params so the ad runs under the
+ * store's Facebook Page alone. Used to retry a store Meta rejected with error
+ * 200/1815199 ("Ad account has no access to this Instagram account") — Meta does not
+ * fall back on its own, so without this the whole store fails.
+ *
+ * Returns whether anything was actually removed: a false result means a retry would
+ * send a byte-identical body, so the caller shouldn't spend the call.
+ */
+export function stripInstagramIdentity(params: Record<string, unknown>): boolean {
+  const oss = params.object_story_spec as Record<string, unknown> | undefined;
+  if (!oss) return false;
+  const had = oss.instagram_user_id !== undefined || oss.instagram_actor_id !== undefined;
+  delete oss.instagram_user_id;
+  delete oss.instagram_actor_id;
+  return had;
+}
+
 // ── Source-creative readers (duplicate mode) ────────────────────────────────────
 // The per-store values a carousel override inherits from the ad it replaces:
 // destination link, primary text, and CTA type — read across every source shape.

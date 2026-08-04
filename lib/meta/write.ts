@@ -32,6 +32,7 @@ export {
   buildDuplicateCreativeParams,
   sourceHasVideo,
   sourceInstagramId,
+  stripInstagramIdentity,
 } from "@/lib/meta/creative-spec";
 export type {
   CreativeInput,
@@ -258,11 +259,9 @@ export interface CampaignAdRef {
 /** What DUPLICATE mode learns about a campaign's source ad in one read. */
 export interface SourceAdMatch {
   creative: DuplicateSourceCreative;
-  /** The chosen source ad — excluded from the duplicate-guard namesake check. */
+  /** The chosen source ad — excluded from the "already created" guard, since a clone
+   *  that keeps the source's name would otherwise match the source itself. */
   sourceAdId: string;
-  /** Every ad in the campaign whose name CONTAINed the query (id/name/ad set) —
-   *  the duplicate guard scans these for an already-existing clone. */
-  namesakes: CampaignAdRef[];
 }
 
 /**
@@ -297,29 +296,63 @@ export async function findSourceAdCreative(
       urlTags: chosen.creative?.url_tags ?? null,
     },
     sourceAdId: chosen.id,
-    namesakes: ads.map((a) => ({
-      id: a.id,
-      name: a.name ?? "",
-      adsetId: a.adset_id ?? null,
-    })),
   };
 }
 
-/** The campaign's ads matching `name` (CONTAIN, cheap identity fields only) — the
- *  duplicate guard's lookup when the clones carry a DIFFERENT name than the source
- *  (the "New ad name" override), which the source-ad read can't see. */
-export async function findAdsNamedLike(
+/** One ad from the account-level name-filtered pull. */
+interface MetaNamedAd {
+  id: string;
+  name?: string;
+  adset_id?: string;
+  campaign_id?: string;
+}
+
+// Page sizes for the ACCOUNT-level name-filtered /ads pull, largest first — same
+// back-off-on-error-#1 posture as the other bulk reads here.
+const NAMED_AD_PAGE_SIZES = [500, 200, 50] as const;
+
+/**
+ * Every ad in the account whose name CONTAINs `name`, grouped by campaign id. ONE
+ * account-level read serves the whole run's "already created" guard, instead of a
+ * lookup per store — the same trade fetchAdsetsByCampaign makes for ad sets.
+ */
+export async function fetchAdsNamedByCampaign(
   token: string,
-  campaignId: string,
+  accountId: string,
   name: string,
-): Promise<CampaignAdRef[]> {
-  const ads = await fetchCampaignAdsNamed<MetaSourceAd>(
-    token,
-    campaignId,
-    name,
-    "id,name,adset_id",
-  );
-  return ads.map((a) => ({ id: a.id, name: a.name ?? "", adsetId: a.adset_id ?? null }));
+): Promise<Map<string, CampaignAdRef[]>> {
+  const filtering = JSON.stringify([{ field: "name", operator: "CONTAIN", value: name }]);
+  let ads: MetaNamedAd[] | null = null;
+  let lastErr: unknown;
+  for (const limit of NAMED_AD_PAGE_SIZES) {
+    try {
+      ads = await get<MetaNamedAd>(
+        `act_${accountId}/ads`,
+        { fields: "id,name,adset_id,campaign_id", limit, filtering },
+        token,
+      );
+      break;
+    } catch (err) {
+      if (err instanceof MetaApiError && err.code === 1) {
+        lastErr = err;
+        // eslint-disable-next-line no-console
+        console.warn(`[meta] act_${accountId}/ads too large at limit=${limit}; backing off`);
+        continue;
+      }
+      throw err;
+    }
+  }
+  if (ads === null) throw lastErr;
+
+  const byCampaign = new Map<string, CampaignAdRef[]>();
+  for (const a of ads) {
+    if (!a.campaign_id) continue;
+    const ref: CampaignAdRef = { id: a.id, name: a.name ?? "", adsetId: a.adset_id ?? null };
+    const list = byCampaign.get(a.campaign_id);
+    if (list) list.push(ref);
+    else byCampaign.set(a.campaign_id, [ref]);
+  }
+  return byCampaign;
 }
 
 interface MetaCampaignIgAd {
