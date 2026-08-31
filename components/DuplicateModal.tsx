@@ -835,6 +835,24 @@ function PlanView({ plan }: { plan: DuplicatePreviewResponse }) {
  * Live countdown from Meta's regain estimate. Purely informational — the resume
  * button stays enabled throughout (the estimate is often pessimistic).
  */
+/** Live countdown to the scheduled hands-off resume. */
+function AutoResumeCountdown({ at }: { at: number }) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  const left = Math.max(0, Math.ceil((at - now) / 1000));
+  const mm = Math.floor(left / 60);
+  const ss = String(left % 60).padStart(2, "0");
+  return (
+    <>
+      Auto-resuming in <span className="font-mono tabular-nums">{mm}:{ss}</span> — hands off,
+      just keep this window open.
+    </>
+  );
+}
+
 function RetryCountdown({ minutes }: { minutes: number }) {
   const [left, setLeft] = useState(minutes * 60);
   useEffect(() => {
@@ -880,12 +898,18 @@ function CreateResultView({
   result,
   creating,
   onResume,
+  autoResumeAt,
+  onCancelAutoResume,
 }: {
   result: CreateAdsResponse;
   /** True while a (re)run is in flight — disables the resume button. */
   creating: boolean;
   /** Re-run just the remaining campaign ids. */
   onResume: () => void;
+  /** Epoch ms of the scheduled hands-off resume, or null when none is armed. */
+  autoResumeAt: number | null;
+  /** Disarm the scheduled resume (falls back to the manual button). */
+  onCancelAutoResume: () => void;
 }) {
   const remaining = result.remaining ?? [];
   const stopped = (result.rateLimited || result.timedOut) && remaining.length > 0;
@@ -923,16 +947,20 @@ function CreateResultView({
               ? `Meta's rate limit paused this run — ${remaining.length} store${remaining.length === 1 ? "" : "s"} still to do.`
               : `Stopped at the time limit — ${remaining.length} store${remaining.length === 1 ? "" : "s"} not attempted yet.`}
           </p>
-          {result.rateLimited ? (
-            <p className="text-fas-12 text-status-mismatch">
-              {result.retryAfterMinutes && result.retryAfterMinutes > 0 ? (
+          <p className="text-fas-12 text-status-mismatch">
+            {autoResumeAt != null ? (
+              <AutoResumeCountdown at={autoResumeAt} />
+            ) : result.rateLimited ? (
+              result.retryAfterMinutes && result.retryAfterMinutes > 0 ? (
                 <RetryCountdown minutes={result.retryAfterMinutes} />
               ) : (
                 "Give it a minute, then resume."
-              )}
-            </p>
-          ) : null}
-          <div>
+              )
+            ) : (
+              "Resume to finish the rest."
+            )}
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
               onClick={onResume}
@@ -945,8 +973,21 @@ function CreateResultView({
                 aria-hidden="true"
                 className={creating ? "animate-spin" : ""}
               />
-              {creating ? "Resuming…" : `Resume (${remaining.length} remaining)`}
+              {creating
+                ? "Resuming…"
+                : autoResumeAt != null
+                  ? `Resume now (${remaining.length} remaining)`
+                  : `Resume (${remaining.length} remaining)`}
             </button>
+            {autoResumeAt != null && !creating ? (
+              <button
+                type="button"
+                onClick={onCancelAutoResume}
+                className="fas-focus rounded-fas-md px-2 py-1.5 text-fas-12 text-ink-muted underline-offset-2 hover:text-ink hover:underline"
+              >
+                Stop auto-resume
+              </button>
+            ) : null}
           </div>
         </div>
       ) : null}
@@ -1086,6 +1127,21 @@ export default function DuplicateModal({
   const [createProgress, setCreateProgress] = useState<{ done: number; total: number } | null>(
     null,
   );
+  // AUTO-RESUME — when a run stops (rate limit / time limit / gateway kill) with
+  // stores remaining, the modal schedules its own resume instead of making the
+  // operator babysit the Resume button through every cooldown. Armed per stop;
+  // cancelled by any manual run, "Stop auto-resume", closing the modal, or the
+  // attempt cap (a limit that never lifts shouldn't retry forever).
+  const MAX_AUTO_RESUMES = 10;
+  const [autoResumeAt, setAutoResumeAt] = useState<number | null>(null);
+  const autoResumeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoResumeAttempts = useRef(0);
+  const cancelAutoResume = useCallback(() => {
+    if (autoResumeTimer.current) clearTimeout(autoResumeTimer.current);
+    autoResumeTimer.current = null;
+    setAutoResumeAt(null);
+  }, []);
+  useEffect(() => cancelAutoResume, [cancelAutoResume]);
 
   const dialogRef = useRef<HTMLDivElement>(null);
 
@@ -1628,6 +1684,8 @@ export default function DuplicateModal({
   async function doCreate(idsOverride?: string[]) {
     const ids = idsOverride ?? campaignIds;
     if (ids.length === 0) return;
+    cancelAutoResume();
+    if (!idsOverride) autoResumeAttempts.current = 0;
     setPhase("creating");
     setCreateError(null);
     if (!idsOverride) setCreateResult(null);
@@ -1741,6 +1799,29 @@ export default function DuplicateModal({
         setCreateResult(merged);
         setCreateProgress({ done: Math.min(i + chunk.length, ids.length), total: ids.length });
         if (stopped) break;
+      }
+
+      // Schedule the hands-off resume. Rate limits wait out Meta's own estimate
+      // (plus a small buffer; 90s when it gave none); a time-limit/gateway stop
+      // just takes a short breather. Thrown errors (the catch below) never
+      // auto-retry — only stops the server itself reported as resumable.
+      const leftover = merged?.remaining ?? [];
+      const stoppedRun = !!merged && (merged.rateLimited || merged.timedOut) && leftover.length > 0;
+      if (stoppedRun && autoResumeAttempts.current < MAX_AUTO_RESUMES) {
+        const waitMs = merged!.rateLimited
+          ? ((merged!.retryAfterMinutes && merged!.retryAfterMinutes > 0
+              ? merged!.retryAfterMinutes * 60
+              : 90) +
+              10) *
+            1000
+          : 10_000;
+        autoResumeAttempts.current += 1;
+        setAutoResumeAt(Date.now() + waitMs);
+        autoResumeTimer.current = setTimeout(() => {
+          autoResumeTimer.current = null;
+          setAutoResumeAt(null);
+          void doCreate(leftover);
+        }, waitMs);
       }
     } catch (err) {
       setCreateError(err instanceof Error ? err.message : "Create failed");
@@ -2330,6 +2411,8 @@ export default function DuplicateModal({
               result={createResult}
               creating={phase === "creating"}
               onResume={() => void doCreate(createResult.remaining ?? [])}
+              autoResumeAt={autoResumeAt}
+              onCancelAutoResume={cancelAutoResume}
             />
           ) : null}
         </div>
