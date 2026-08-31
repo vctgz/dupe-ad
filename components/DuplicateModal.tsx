@@ -1709,7 +1709,12 @@ export default function DuplicateModal({
           // ads the killed run had made), keep what earlier chunks reported and offer
           // Resume over everything unconfirmed — the server skips stores that already
           // have this ad, so resuming can't double-create.
-          if (res.status === 504 || res.status === 502 || res.status === 408) {
+          //
+          // Only a BODYLESS 502/504/408 is a gateway kill: the route itself returns
+          // real JSON errors under 502 ("Could not load campaigns/ad sets…", video
+          // verification failures) whose message must reach the operator, not be
+          // mislabeled as a timeout.
+          if ((res.status === 504 || res.status === 502 || res.status === 408) && !body.error) {
             merged = {
               ...(merged ?? { count: 0, created: 0, failed: 0, results: [] }),
               timedOut: true,

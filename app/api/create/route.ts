@@ -355,6 +355,14 @@ async function verifyVideosReady(
 export async function POST(
   req: NextRequest,
 ): Promise<NextResponse<CreateAdsResponse | ApiError>> {
+  // The wall-clock budget is measured from REQUEST ENTRY, not from the write loop:
+  // preflight (live discovery on a cold cache, media uploads, video checks, the
+  // ad-set and duplicate-guard pulls) can itself take tens of seconds on a big
+  // account, and a budget that started after it let preflight + loop overshoot
+  // maxDuration — the gateway killed the request with 0 stores attempted and no
+  // body. Counting preflight against the budget guarantees the response ships.
+  const startedAt = Date.now();
+
   // Reject oversized bodies before buffering them (one ~5MB image + JSON overhead).
   const contentLength = Number(req.headers.get("content-length") ?? "0");
   if (Number.isFinite(contentLength) && contentLength > 12_000_000) {
@@ -716,13 +724,17 @@ export async function POST(
   // into the same wall — the modal offers a one-click resume.
   const wanted = [...new Set(campaignIds)];
   const results: CreateAdResultRow[] = [];
-  const startedAt = Date.now();
-  // Wall-clock budget, checked BETWEEN stores. It must leave room for the slowest
-  // single store to finish inside maxDuration (60s): a video store can spend an IG
-  // lookup, a creative+ad batch, and a 5s rate-limit backoff after the check passes.
-  // At 50s that overshot, and Vercel killed the request — a 504 with NO body, so ads
-  // this run had already created were invisible to the client and a re-run duplicated
-  // them. 40s keeps the whole response inside the limit.
+  // Wall-clock budget (from request entry), checked BETWEEN stores. It must leave
+  // room for the slowest single store to finish inside maxDuration (60s): a video
+  // store can spend an IG lookup, a creative+ad batch, and a 5s rate-limit backoff
+  // after the check passes. A preflight that ate the whole budget makes the loop
+  // break on its first iteration and return every store as `remaining` — a clean
+  // resumable response instead of a gateway kill.
+  // eslint-disable-next-line no-console
+  console.info(
+    `[create] ${account.slug} preflight done in ${Date.now() - startedAt}ms ` +
+      `(mode=${mode}, stores=${wanted.length})`,
+  );
   const BUDGET_MS = 40_000;
   const PACE_AT = 85; // utilization percent where writes start slowing down
   const RETRY_BACKOFF_MS = 5_000;
