@@ -63,8 +63,10 @@ import type { CampaignRow, DiscoveryResult } from "@/lib/discovery/types";
 
 export const dynamic = "force-dynamic";
 // Live writes fan out serialized across many stores; give the function headroom beyond
-// Vercel's short default (60s is the Hobby ceiling; raise on Pro for very large batches).
-export const maxDuration = 60;
+// Vercel's short default. This project is on Pro, whose ceiling is 300s — at ~3s per
+// video store that lets a full 20-store chunk (the modal's CREATE_CHUNK) finish in one
+// request instead of stopping at ~13 stores and demanding a manual Resume per round.
+export const maxDuration = 300;
 
 /** Meta's subcode for "Ad account has no access to this Instagram account." */
 const IG_NO_ACCESS_SUBCODE = 1815199;
@@ -725,7 +727,7 @@ export async function POST(
   const wanted = [...new Set(campaignIds)];
   const results: CreateAdResultRow[] = [];
   // Wall-clock budget (from request entry), checked BETWEEN stores. It must leave
-  // room for the slowest single store to finish inside maxDuration (60s): a video
+  // room for the slowest single store to finish inside maxDuration (300s): a video
   // store can spend an IG lookup, a creative+ad batch, and a 5s rate-limit backoff
   // after the check passes. A preflight that ate the whole budget makes the loop
   // break on its first iteration and return every store as `remaining` — a clean
@@ -735,7 +737,7 @@ export async function POST(
     `[create] ${account.slug} preflight done in ${Date.now() - startedAt}ms ` +
       `(mode=${mode}, stores=${wanted.length})`,
   );
-  const BUDGET_MS = 40_000;
+  const BUDGET_MS = 280_000;
   const PACE_AT = 85; // utilization percent where writes start slowing down
   const RETRY_BACKOFF_MS = 5_000;
   const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
