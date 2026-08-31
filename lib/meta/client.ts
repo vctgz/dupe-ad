@@ -124,6 +124,10 @@ const PIPEBOARD_FETCH_COOLDOWN_MS = 60_000;
 
 let pipeboardCache: { token: string; expiresAt: number } | null = null;
 let pipeboardCooldownUntil = 0;
+// Set when Pipeboard answers 410: they removed the raw-token endpoint permanently
+// (their sanctioned paths are the remote MCP or bring-your-own Meta token), so
+// retrying is pointless for the life of this process.
+let pipeboardGone = false;
 
 /**
  * The Meta access token Pipeboard holds for the connected Meta account, fetched
@@ -134,7 +138,7 @@ let pipeboardCooldownUntil = 0;
  */
 async function getPipeboardToken(): Promise<string | null> {
   const apiToken = process.env.PIPEBOARD_API_TOKEN?.trim();
-  if (!apiToken) return null;
+  if (!apiToken || pipeboardGone) return null;
   const now = Date.now();
   if (pipeboardCache && pipeboardCache.expiresAt - now > PIPEBOARD_REFRESH_MARGIN_MS) {
     return pipeboardCache.token;
@@ -145,6 +149,15 @@ async function getPipeboardToken(): Promise<string | null> {
       `${PIPEBOARD_TOKEN_URL}?api_token=${encodeURIComponent(apiToken)}`,
       { cache: "no-store", headers: { Accept: "application/json" } },
     );
+    if (res.status === 410) {
+      pipeboardGone = true;
+      // eslint-disable-next-line no-console
+      console.warn(
+        "[meta] Pipeboard has removed its raw-token endpoint (HTTP 410) — the " +
+          "Pipeboard fallback is permanently unavailable; disabling for this process.",
+      );
+      return null;
+    }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = (await res.json()) as { access_token?: string; expires_at?: string };
     if (!data.access_token) throw new Error("response carried no access_token");
