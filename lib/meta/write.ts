@@ -365,16 +365,35 @@ interface MetaCampaignIgAd {
   };
 }
 
+// Two-tier cache of each campaign's resolved Instagram identity (in-process L1,
+// shared KV L2 — same shape as the pixel cache). A campaign's IG binding effectively
+// never changes between runs, yet a Runnings-style video run (discovery resolves no
+// IGs there) did one paginated /ads read PER STORE PER RUN to find it — ~89 reads of
+// static data per run, a large share of the account's hourly quota. Null results are
+// cached too (wrapped, so a legitimate "no IG" is distinguishable from a miss).
+const campaignIgCache = new Map<string, string | null>();
+const CAMPAIGN_IG_KV_TTL_SEC = 24 * 3600;
+
 /**
  * Resolve ONE campaign's own Instagram identity from its existing ads' creatives.
  * Used when a video write needs an explicit `instagram_user_id` (error 100/1772103)
  * but discovery resolved none for the store — multi-IG accounts keep each store's
  * IG only in that store's campaign history. Returns null when no ad carries one.
+ * Cached (memory + KV): the binding is static between runs.
  */
 export async function findCampaignInstagramId(
   token: string,
   campaignId: string,
 ): Promise<string | null> {
+  const cached = campaignIgCache.get(campaignId);
+  if (cached !== undefined) return cached;
+  const kvKey = `dupe:ig:${campaignId}`;
+  const fromKv = await kvGet<{ igId: string | null }>(kvKey);
+  if (fromKv) {
+    campaignIgCache.set(campaignId, fromKv.igId);
+    return fromKv.igId;
+  }
+
   let ads: MetaCampaignIgAd[] | null = null;
   let lastErr: unknown;
   for (const limit of SOURCE_AD_PAGE_SIZES) {
@@ -399,7 +418,10 @@ export async function findCampaignInstagramId(
     }
   }
   if (ads === null) throw lastErr;
-  return instagramIdFromCampaignAds(ads);
+  const igId = instagramIdFromCampaignAds(ads);
+  campaignIgCache.set(campaignId, igId);
+  await kvSet(kvKey, { igId }, CAMPAIGN_IG_KV_TTL_SEC);
+  return igId;
 }
 
 interface MetaPixel {
