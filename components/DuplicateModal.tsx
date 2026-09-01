@@ -835,6 +835,54 @@ function PlanView({ plan }: { plan: DuplicatePreviewResponse }) {
  * Live countdown from Meta's regain estimate. Purely informational — the resume
  * button stays enabled throughout (the estimate is often pessimistic).
  */
+/**
+ * The session cookie lasts 12h. A tab left open past that finds out only on its next
+ * API call, which the middleware answers with a bare 401 — inside this modal that used
+ * to surface as a confusing downstream error (the Blob SDK's "Failed to retrieve the
+ * client token", a "Create failed (HTTP 401)", …). Send the operator to the login page
+ * instead; the form returns them here afterwards via ?next=.
+ */
+function redirectToLogin(): void {
+  const next = window.location.pathname + window.location.search;
+  window.location.assign(`/login?next=${encodeURIComponent(next)}`);
+}
+
+/** Kick off the login redirect and return the message to show meanwhile. */
+function sessionExpiredMessage(): string {
+  redirectToLogin();
+  return "Your session expired — sending you to the login page.";
+}
+
+/**
+ * Explain a Blob client-token failure. The Blob SDK hides WHY our token route refused
+ * (it only knows the reply wasn't a 2xx JSON carrying a clientToken), so re-ask the
+ * route with the same event and read its real answer: a 401 is an expired session
+ * (→ login); anything else is the route's own message (file type, size, path).
+ */
+async function explainBlobTokenFailure(pathname: string, accountSlug: string): Promise<string> {
+  try {
+    const res = await fetch("/api/blob-upload", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        type: "blob.generate-client-token",
+        payload: {
+          pathname,
+          callbackUrl: `${window.location.origin}/api/blob-upload`,
+          clientPayload: JSON.stringify({ accountSlug }),
+          multipart: true,
+        },
+      }),
+    });
+    if (res.status === 401) return sessionExpiredMessage();
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    if (!res.ok) return `Upload was refused: ${body.error ?? `HTTP ${res.status}`}`;
+    return "Upload authorization failed unexpectedly — please try the file again.";
+  } catch {
+    return "Could not reach the upload service — check your connection and try again.";
+  }
+}
+
 /** Live countdown to the scheduled hands-off resume. */
 function AutoResumeCountdown({ at }: { at: number }) {
   const [now, setNow] = useState(Date.now());
@@ -1507,7 +1555,11 @@ export default function DuplicateModal({
             error?: string;
           };
           if (!res.ok || !body.videoId) {
-            throw new Error(body.error ?? `Video registration failed (HTTP ${res.status})`);
+            throw new Error(
+              res.status === 401
+                ? sessionExpiredMessage()
+                : body.error ?? `Video registration failed (HTTP ${res.status})`,
+            );
           }
           if (videoGenRef.current[key] !== gen) return;
           const videoId = body.videoId;
@@ -1524,7 +1576,13 @@ export default function DuplicateModal({
               progress?: number | null;
               error?: string;
             };
-            if (!sres.ok) throw new Error(sbody.error ?? "Video status check failed");
+            if (!sres.ok) {
+              throw new Error(
+                sres.status === 401
+                  ? sessionExpiredMessage()
+                  : sbody.error ?? "Video status check failed",
+              );
+            }
             if (videoGenRef.current[key] !== gen) return;
             if (sbody.status === "ready") {
               patch((v) => ({ ...v, phase: "ready", processingPct: 100 }));
@@ -1542,11 +1600,11 @@ export default function DuplicateModal({
           }
         } catch (err) {
           if (videoGenRef.current[key] !== gen) return;
-          patch((v) => ({
-            ...v,
-            phase: "error",
-            error: err instanceof Error ? err.message : "Video upload failed",
-          }));
+          let message = err instanceof Error ? err.message : "Video upload failed";
+          if (/retrieve the client token/i.test(message)) {
+            message = await explainBlobTokenFailure(`ad-videos/${file.name}`, accountSlug);
+          }
+          patch((v) => ({ ...v, phase: "error", error: message }));
         }
       })();
 
@@ -1622,7 +1680,11 @@ export default function DuplicateModal({
         error?: string;
       };
       if (!res.ok) {
-        throw new Error(body.error ?? `Generation failed (HTTP ${res.status})`);
+        throw new Error(
+          res.status === 401
+            ? sessionExpiredMessage()
+            : body.error ?? `Generation failed (HTTP ${res.status})`,
+        );
       }
       setPrimaryText(body.primaryText ?? "");
       setHeadline(body.headline ?? "");
@@ -1659,7 +1721,11 @@ export default function DuplicateModal({
       });
       if (!res.ok) {
         const body = (await res.json().catch(() => ({}))) as { error?: string };
-        throw new Error(body.error ?? `Preview failed (HTTP ${res.status})`);
+        throw new Error(
+          res.status === 401
+            ? sessionExpiredMessage()
+            : body.error ?? `Preview failed (HTTP ${res.status})`,
+        );
       }
       setPlan((await res.json()) as DuplicatePreviewResponse);
     } catch (err) {
@@ -1785,7 +1851,11 @@ export default function DuplicateModal({
             );
             break;
           }
-          throw new Error(body.error ?? `Create failed (HTTP ${res.status})`);
+          throw new Error(
+            res.status === 401
+              ? sessionExpiredMessage()
+              : body.error ?? `Create failed (HTTP ${res.status})`,
+          );
         }
         merged = merged ? mergeCreateResults(merged, body) : body;
         const stopped = body.rateLimited || body.timedOut;
